@@ -316,14 +316,21 @@ export function ChannelSidebar({
       {/* Voice Panel */}
       {connectedVoice && (
         <VoicePanel
-          channelName={connectedVoice.channelName} serverName={connectedVoice.serverName}
-          onDisconnect={onLeaveVoice} isMuted={isMuted} isDeafened={isDeafened}
-          onToggleMute={onToggleMute} onToggleDeafen={onToggleDeafen}
-          onToggleScreenShare={onToggleScreenShare} onToggleCamera={onToggleCamera}
-          onToggleStreaming={onToggleStreaming} isScreenSharing={isScreenSharing}
-          isCameraOn={isCameraOn} isStreaming={isStreaming}
-          joinedAt={callStartTime ?? connectedVoice.joinedAt}
-          connectedUserCount={currentVoiceUserCount} userLimit={currentVoiceChannelData?.userLimit}
+          channelName={connectedVoice.channelName} 
+          serverName={connectedVoice.serverName}
+          channelId={connectedVoice.channelId}
+          currentUser={currentUser as any}
+          otherUser={undefined}
+          onDisconnect={onLeaveVoice} 
+          isMuted={isMuted} 
+          isDeafened={isDeafened}
+          onToggleMute={onToggleMute} 
+          onToggleDeafen={onToggleDeafen}
+          onToggleScreenShare={onToggleScreenShare} 
+          onToggleCamera={onToggleCamera}
+          isScreenSharing={isScreenSharing}
+          isCameraOn={isCameraOn}
+          connectedUserCount={currentVoiceUserCount}
         />
       )}
 

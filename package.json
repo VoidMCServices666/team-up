@@ -13,10 +13,15 @@
     "@emotion/react": "^11.13.3",
     "@supabase/supabase-js": "^2.99.1",
     "firebase": "^12.10.0",
+    "firebase-admin": "^13.7.0",
     "framer-motion": "^11.5.4",
+    "livekit": "^0.0.1",
+    "livekit-client": "^2.17.3",
+    "livekit-server-sdk": "^2.15.0",
     "lucide-react": "0.522.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "supabase": "^2.83.0",
     "tsc": "^2.0.4"
   },
   "devDependencies": {

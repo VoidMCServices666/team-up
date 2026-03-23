@@ -4,7 +4,6 @@ import {
   PaperclipIcon, StickerIcon, SmileIcon, SendIcon, MicIcon, SquareIcon,
   XIcon, FileIcon, AtSignIcon, PhoneIcon, VideoIcon, ChevronUpIcon, ArrowDownIcon,
 } from 'lucide-react'
-import { DMProfilePanel } from './DMProfilePanel'
 import { MessageBubble } from './MessageBubble'
 import { WumpusEmptyState } from './WumpusEmptyState'
 import { EmojiPicker } from './EmojiPicker'
@@ -16,43 +15,8 @@ import { encodeEmojiPack, type CustomEmojiPack } from './EmojiPicker'
 import { UserAvatar } from './UserAvatar'
 import { db, syncChannel } from '../lib/database'
 import type { Channel, Message, Member } from '../App'
-import { motion, AnimatePresence } from 'framer-motion'
-import { ChatSkeleton } from './SkeletonLoader'
+import { useAnimSetting, ANIMATION_KEYS } from '../lib/animationSettings'
 import { useI18n } from '../lib/i18n'
-
-const CLOUDINARY_CLOUD_NAME = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME
-const CLOUDINARY_UPLOAD_PRESET = 'teamup_uploads'
-const MAX_BASE64_SIZE = 500 * 1024 // 500KB - لو أصغر من كده نبعته base64
-
-// ── Upload to Cloudinary ──────────────────────────────────────────────────────
-async function uploadToCloudinary(file: File): Promise<string> {
-  const formData = new FormData()
-  formData.append('file', file)
-  formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET)
-
-  const res = await fetch(
-    `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/auto/upload`,
-    { method: 'POST', body: formData }
-  )
-
-  if (!res.ok) throw new Error('Cloudinary upload failed')
-  const data = await res.json()
-  return data.secure_url
-}
-
-// ── Process file: Cloudinary for big files, base64 for small ─────────────────
-async function processFile(file: File): Promise<{ name: string; size: number; url: string; type: string }> {
-  if (file.size > MAX_BASE64_SIZE) {
-    const url = await uploadToCloudinary(file)
-    return { name: file.name, size: file.size, url, type: file.type }
-  } else {
-    return new Promise((resolve) => {
-      const reader = new FileReader()
-      reader.onloadend = () => resolve({ name: file.name, size: file.size, url: reader.result as string, type: file.type })
-      reader.readAsDataURL(file)
-    })
-  }
-}
 
 interface ChatAreaProps {
   channel: Channel | null
@@ -69,16 +33,18 @@ interface ChatAreaProps {
   serverMembers?: Member[]
   onStartCall?: (withVideo?: boolean) => void
   dmUserId?: string
-  dmUser?: import('../App').Member
+  dmUser?: Member
   presenceMap?: Record<string, string>
   onOpenMobileMenu?: () => void
   contextId?: string
+  members?: Member[] // Added for mentions
 }
 
 export function ChatArea({
   channel, messages, onSendMessage, onEditMessage, onDeleteMessage,
   currentUser, onMemberClick, showMemberList, onToggleMemberList,
   isDM = false, serverId, serverMembers, onStartCall, dmUserId, dmUser, presenceMap = {}, onOpenMobileMenu, contextId: contextIdProp,
+  members = [], // Added
 }: ChatAreaProps) {
   const { t } = useI18n()
   const [messageInput, setMessageInput] = useState('')
@@ -106,10 +72,9 @@ export function ChatArea({
   const [canPin, setCanPin] = useState(false)
   const [dmUserStatus, setDmUserStatus] = useState<{ status: string } | null>(null)
   const [pinnedMessageIds, setPinnedMessageIds] = useState<Set<string>>(new Set())
-  const [isUploading, setIsUploading] = useState(false)
-  const [isLoadingMessages, setIsLoadingMessages] = useState(true)
-  const [replyTo, setReplyTo] = useState<{ messageId: string; content: string; authorName: string; authorAvatar?: string } | null>(null)
-  const [showDMProfile, setShowDMProfile] = useState(true)
+  const [showMentionDropdown, setShowMentionDropdown] = useState(false)
+  const [mentionQuery, setMentionQuery] = useState('')
+  const [mentionStart, setMentionStart] = useState(-1)
 
   useEffect(() => {
     if (!isDM || !dmUserId || !currentUser) {
@@ -147,12 +112,11 @@ export function ChatArea({
   }, [isDM, serverId, currentUser.id])
 
   useEffect(() => {
-    if (!isDM || !channel) return
-    db.getUsers().then((users) => {
-      const dmUser = users.find((u) => u.username === channel.name)
-      if (dmUser) setDmUserStatus({ status: dmUser.status })
-    })
-  }, [isDM, channel?.name])
+    if (!isDM || !dmUserId) return
+    // ✅ استخدم presenceMap مباشرة - real-time بدل db.getUsers
+    const status = presenceMap[dmUserId] || 'offline'
+    setDmUserStatus({ status })
+  }, [isDM, dmUserId, presenceMap])
 
   useEffect(() => {
     const contextId = isDM && channel ? (channel.id === 'dm' ? '' : channel.id) : channel?.id || ''
@@ -187,31 +151,16 @@ export function ChatArea({
     else setUnreadCount((c) => c + added)
   }, [messages, isPinnedToBottom])
 
-  // ✅ ref عشان نتتبع الـ channel id الحالي ونمنع race condition
-  const loadingChannelRef = useRef<string | null>(null)
-
   useEffect(() => {
-    const cid = channel?.id || null
-    loadingChannelRef.current = cid
     setIsPinnedToBottom(true); setUnreadCount(0); setShowScrollTop(false)
-    setIsLoadingMessages(true)
-    prevMessageCountRef.current = 0
+    prevMessageCountRef.current = messages.length
     setTimeout(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'instant' as ScrollBehavior }) }, 0)
-    // ✅ fallback: لو بعد 2 ثانية لسه loading → اخفيه (يعني channel فاضي أو Firebase بطيء)
-    const fallback = setTimeout(() => {
-      if (loadingChannelRef.current === cid) setIsLoadingMessages(false)
-    }, 2000)
-    return () => clearTimeout(fallback)
   }, [channel?.id])
 
   const scrollToBottom = () => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); setUnreadCount(0); setIsPinnedToBottom(true) }
   const scrollToTop = () => { messagesContainerRef.current?.scrollTo({ top: 0, behavior: 'smooth' }) }
 
-  useEffect(() => {
-    // ✅ لما messages تيجي من الـ Firebase → اخفي الـ skeleton فوراً
-    setIsLoadingMessages(false)
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
   useEffect(() => { return () => { if (recordingIntervalRef.current) clearInterval(recordingIntervalRef.current) } }, [])
 
   useEffect(() => {
@@ -227,21 +176,18 @@ export function ChatArea({
     return () => syncChannel.removeEventListener('message', handler)
   }, [currentUser.id])
 
-  // ── handleSend: Cloudinary للصور الكبيرة، base64 للصغيرة ──────────────────
+  // ── handleSend: base64 بدل blob URLs ──────────────────────────────────────
   const handleSend = async () => {
     if (messageInput.trim() || attachedFiles.length > 0) {
-      setIsUploading(true)
-      try {
-        const attachments = await Promise.all(attachedFiles.map(processFile))
-        onSendMessage(messageInput.trim(), attachments.length > 0 ? attachments : undefined, undefined, replyTo ?? undefined)
-        setMessageInput('')
-        setAttachedFiles([])
-        setReplyTo(null)
-      } catch (err) {
-        console.error('Failed to upload files:', err)
-      } finally {
-        setIsUploading(false)
-      }
+      const attachments = await Promise.all(
+        attachedFiles.map((file) => new Promise<{ name: string; size: number; url: string; type: string }>((resolve) => {
+          const reader = new FileReader()
+          reader.onloadend = () => resolve({ name: file.name, size: file.size, url: reader.result as string, type: file.type })
+          reader.readAsDataURL(file)
+        }))
+      )
+      onSendMessage(messageInput.trim(), attachments.length > 0 ? attachments : undefined)
+      setMessageInput(''); setAttachedFiles([])
     }
   }
 
@@ -263,6 +209,7 @@ export function ChatArea({
     } catch (err) { console.error('Failed to start recording:', err) }
   }
 
+  // ── stopRecording: base64 بدل blob URL ────────────────────────────────────
   const stopRecording = () => {
     if (mediaRecorderRef.current && isRecording) {
       const duration = recordingDuration
@@ -289,36 +236,28 @@ export function ChatArea({
 
   const handleContainerClick = (e: React.MouseEvent) => { if ((e.target as HTMLElement).closest('button')) return; textInputRef.current?.focus() }
   const handleEmojiSelect = (emoji: string) => { setMessageInput((prev) => prev + emoji); setShowEmojiPicker(false); textInputRef.current?.focus() }
-  const handleGifSelect = (url: string) => {
-    // GIF من Tenor → URL خارجي جاهز، مش محتاج رفع
-    onSendMessage('', [{ name: 'gif', size: 1, url, type: 'image/gif' }])
-    setShowGifStickerPicker(false)
+  const handleGifSelect = (url: string) => { onSendMessage('', [{ name: 'gif', size: 0, url, type: 'image/gif' }]); setShowGifStickerPicker(false) }
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value
+    setMessageInput(value)
+
+    const atIndex = value.lastIndexOf('@')
+    if (atIndex !== -1 && (atIndex === 0 || value[atIndex - 1] === ' ')) {
+      const query = value.slice(atIndex + 1)
+      setMentionQuery(query)
+      setMentionStart(atIndex)
+      setShowMentionDropdown(true)
+    } else {
+      setShowMentionDropdown(false)
+      setMentionQuery('')
+      setMentionStart(-1)
+    }
   }
 
-  const handleStickerSelect = async (url: string, pack?: StickerPack) => {
+  const handleStickerSelect = (url: string, pack?: StickerPack) => {
     const name = pack ? `sticker::${btoa(unescape(encodeURIComponent(JSON.stringify({ id: pack.id, name: pack.name, stickers: pack.stickers }))))}` : 'sticker'
-    let finalUrl = url
-    // ✅ لو base64 → لازم نرفعه على Cloudinary قبل الإرسال
-    if (url.startsWith('data:')) {
-      setIsUploading(true)
-      setShowGifStickerPicker(false)
-      try {
-        const blob = await fetch(url).then(r => r.blob())
-        const file = new File([blob], 'sticker.png', { type: blob.type || 'image/png' })
-        finalUrl = await uploadToCloudinary(file)
-      } catch (err) {
-        console.error('Sticker upload failed:', err)
-        setIsUploading(false)
-        alert('Failed to send sticker. Please try again.')
-        return // ✅ مش نبعت لو فشل الـ upload
-      } finally {
-        setIsUploading(false)
-      }
-    } else {
-      setShowGifStickerPicker(false)
-    }
-    // ✅ بنبعت بالـ Cloudinary URL مش الـ base64
-    onSendMessage('', [{ name, size: 1, url: finalUrl, type: 'image/png' }])
+    onSendMessage('', [{ name, size: 0, url, type: 'image/png' }]); setShowGifStickerPicker(false)
   }
 
   const handleSendPack = (pack: StickerPack) => {
@@ -349,9 +288,7 @@ export function ChatArea({
   const statusLabels: Record<string, string> = { online: t('chat.online'), idle: t('chat.idle'), dnd: t('chat.dnd'), offline: t('chat.offline') }
 
   return (
-    <div className="flex-1 flex flex-row bg-[#1e1e2e] min-h-0 overflow-hidden">
-      {/* Main chat column */}
-      <div className="flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden">
+    <div className="flex-1 flex flex-col bg-[#1e1e2e] min-h-0 overflow-hidden">
       <div className="h-12 px-4 flex items-center justify-between border-b border-[#11111b] shadow-sm">
         <div className="flex items-center gap-2 min-w-0">
           {onOpenMobileMenu && (
@@ -388,17 +325,10 @@ export function ChatArea({
             </>
           )}
           {isDM && (
-            <>
-              <div className="relative">
-                <button onClick={() => { setShowPinnedMessages(!showPinnedMessages); setShowSearchPanel(false); setShowInboxPanel(false) }} className={`transition-colors ${showPinnedMessages ? 'text-[#cdd6f4]' : 'text-[#bac2de] hover:text-[#cdd6f4]'}`}><PinIcon className="w-5 h-5" /></button>
-                {showPinnedMessages && contextId && <div className="absolute top-full right-0 mt-2 z-50"><PinnedMessages contextId={contextId} messages={messages} currentUser={currentUser} onClose={() => setShowPinnedMessages(false)} onUnpin={handleUnpinMessage} canPin={canPin} /></div>}
-              </div>
-              {dmUser && (
-                <button onClick={() => setShowDMProfile(!showDMProfile)} className={`transition-colors ${showDMProfile ? 'text-[#cdd6f4]' : 'text-[#bac2de] hover:text-[#cdd6f4]'}`} title="Toggle Profile">
-                  <UsersIcon className="w-5 h-5" />
-                </button>
-              )}
-            </>
+            <div className="relative">
+              <button onClick={() => { setShowPinnedMessages(!showPinnedMessages); setShowSearchPanel(false); setShowInboxPanel(false) }} className={`transition-colors ${showPinnedMessages ? 'text-[#cdd6f4]' : 'text-[#bac2de] hover:text-[#cdd6f4]'}`}><PinIcon className="w-5 h-5" /></button>
+              {showPinnedMessages && contextId && <div className="absolute top-full right-0 mt-2 z-50"><PinnedMessages contextId={contextId} messages={messages} currentUser={currentUser} onClose={() => setShowPinnedMessages(false)} onUnpin={handleUnpinMessage} canPin={canPin} /></div>}
+            </div>
           )}
           {!isDM && (
             <>
@@ -426,17 +356,13 @@ export function ChatArea({
       </div>
 
       <div ref={messagesContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-4 py-4 space-y-4 relative min-h-0" style={{ fontSize: 'var(--chat-font-size, 16px)' }}>
-        {/* ✅ Skeleton loading */}
-        {isLoadingMessages && <ChatSkeleton />}
-        <AnimatePresence>
-          {showScrollTop && (
-            <motion.button key="scroll-top" initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: 0.18 }} onClick={scrollToTop} className="sticky top-2 float-right mr-0 z-20 w-8 h-8 rounded-full bg-[#313244] hover:bg-[#45475a] border border-[#45475a] text-[#bac2de] hover:text-[#cdd6f4] flex items-center justify-center shadow-lg transition-colors" title="Scroll to top">
-              <ChevronUpIcon className="w-4 h-4" />
-            </motion.button>
-          )}
-        </AnimatePresence>
+        {showScrollTop && (
+          <button onClick={scrollToTop} className="sticky top-2 float-right mr-0 z-20 w-8 h-8 rounded-full bg-[#313244] hover:bg-[#45475a] border border-[#45475a] text-[#bac2de] hover:text-[#cdd6f4] flex items-center justify-center shadow-lg transition-colors" title="Scroll to top">
+            <ChevronUpIcon className="w-4 h-4" />
+          </button>
+        )}
 
-        {!isLoadingMessages && messages.length === 0 ? (
+        {messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-center">
             <div className="w-16 h-16 bg-[#cba6f7] rounded-full flex items-center justify-center mb-4">
               {isDM ? <AtSignIcon className="w-8 h-8 text-white" /> : <HashIcon className="w-8 h-8 text-white" />}
@@ -444,58 +370,59 @@ export function ChatArea({
             <h2 className="text-2xl font-bold text-[#cdd6f4] mb-2">{isDM ? `${t('chat.welcomeDM')}${channel.name}.` : `${t('chat.welcomeChannel')}${channel.name}!`}</h2>
             <p className="text-[#a6adc8]">{isDM ? `${t('chat.sayHello')}${channel.name}!` : `${t('chat.startOfChannel')}${channel.name}${t('chat.channel')}`}</p>
           </div>
-        ) : !isLoadingMessages ? (
+        ) : (
           messages.map((message) => (
             <MessageBubble
               key={message.id} message={message} isOwnMessage={message.author.id === currentUser.id}
               onAuthorClick={onMemberClick} onEdit={onEditMessage} onDelete={onDeleteMessage}
               serverId={serverId} onPin={handlePinMessage} onUnpin={handleUnpinMessage}
-              isPinned={pinnedMessageIds.has(message.id)} canPin={canPin} currentUserId={currentUser.id}
-              contextId={contextId || contextIdProp || ''}
-              onReply={(msg) => setReplyTo({ messageId: msg.id, content: msg.content, authorName: msg.author.displayName, authorAvatar: msg.author.avatar })}
+              isPinned={pinnedMessageIds.has(message.id)}
+              canPin={canPin} currentUserId={currentUser.id}
             />
           ))
-        ) : null}
+        )}
         <div ref={messagesEndRef} />
       </div>
 
-      <AnimatePresence>
-        {unreadCount > 0 && (
-          <motion.button key="new-messages" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 12 }} transition={{ duration: 0.2 }} onClick={scrollToBottom} className="absolute bottom-[140px] right-6 z-30 flex items-center gap-1.5 bg-[#cba6f7] hover:bg-[#b4befe] text-white text-xs font-semibold px-3 py-1.5 rounded-full shadow-lg shadow-[#cba6f7]/30 transition-colors">
-            <ArrowDownIcon className="w-3.5 h-3.5" />
-            {unreadCount} new {unreadCount === 1 ? 'message' : 'messages'}
-          </motion.button>
-        )}
-      </AnimatePresence>
+      {unreadCount > 0 && (
+        <button onClick={scrollToBottom} className="absolute bottom-[140px] right-6 z-30 flex items-center gap-1.5 bg-[#cba6f7] hover:bg-[#b4befe] text-white text-xs font-semibold px-3 py-1.5 rounded-full shadow-lg shadow-[#cba6f7]/30 transition-colors">
+          <ArrowDownIcon className="w-3.5 h-3.5" />
+          {unreadCount} new {unreadCount === 1 ? 'message' : 'messages'}
+        </button>
+      )}
 
-      <AnimatePresence>
-        {attachedFiles.length > 0 && (
-          <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="px-4 bg-[#181825] border-t border-[#11111b]">
-            <div className="py-2 flex flex-wrap gap-2">
-              {attachedFiles.map((file, index) => (
-                <div key={index} className="flex items-center gap-2 bg-[#1e1e2e] rounded px-3 py-2 text-sm">
-                  <FileIcon className="w-4 h-4 text-[#bac2de]" />
-                  <span className="text-[#cdd6f4] max-w-32 truncate">{file.name}</span>
-                  <span className="text-[#6c7086]">({formatFileSize(file.size)})</span>
-                  <button onClick={() => removeAttachedFile(index)} className="text-[#bac2de] hover:text-red-400 transition-colors"><XIcon className="w-4 h-4" /></button>
-                </div>
-              ))}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {attachedFiles.length > 0 && (
+        <div className="px-4 bg-[#181825] border-t border-[#11111b]">
+          <div className="py-2 flex flex-wrap gap-2">
+            {attachedFiles.map((file, index) => (
+              <div key={index} className="flex items-center gap-2 bg-[#1e1e2e] rounded px-3 py-2 text-sm">
+                <FileIcon className="w-4 h-4 text-[#bac2de]" />
+                <span className="text-[#cdd6f4] max-w-32 truncate">{file.name}</span>
+                <span className="text-[#6c7086]">({formatFileSize(file.size)})</span>
+                <button onClick={() => removeAttachedFile(index)} className="text-[#bac2de] hover:text-red-400 transition-colors"><XIcon className="w-4 h-4" /></button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="px-4 pb-6 relative">
         {showEmojiPicker && <div className="absolute bottom-full right-4 mb-2 z-50"><EmojiPicker onEmojiSelect={handleEmojiSelect} onClose={() => setShowEmojiPicker(false)} currentUserId={currentUser.id} onSendPack={handleSendEmojiPack} /></div>}
         {showGifStickerPicker && <div className="absolute bottom-full right-4 mb-2 z-50"><GifStickerPicker currentUserId={currentUser.id} onSelectGif={handleGifSelect} onSelectSticker={handleStickerSelect} onSendPack={handleSendPack} onClose={() => setShowGifStickerPicker(false)} /></div>}
-        {/* ✅ Reply preview */}
-        {replyTo && (
-          <div className="mb-2 px-3 py-2 bg-[#313244] rounded-t-lg border-l-2 border-[#cba6f7] flex items-center justify-between">
-            <div className="flex items-center gap-2 min-w-0">
-              <span className="text-[#cba6f7] text-xs font-semibold flex-shrink-0">↩ Replying to {replyTo.authorName}</span>
-              <span className="text-[#6c7086] text-xs truncate">{replyTo.content.slice(0, 60)}{replyTo.content.length > 60 ? '...' : ''}</span>
-            </div>
-            <button onClick={() => setReplyTo(null)} className="text-[#6c7086] hover:text-[#cdd6f4] flex-shrink-0 ml-2"><XIcon className="w-3.5 h-3.5" /></button>
+        {showMentionDropdown && (
+          <div className="absolute bottom-full left-4 mb-2 z-50 bg-[#181825] border border-[#11111b] rounded-lg shadow-lg max-h-48 overflow-y-auto w-64">
+            {members.filter(m => m.username.toLowerCase().includes(mentionQuery.toLowerCase()) || m.displayName?.toLowerCase().includes(mentionQuery.toLowerCase())).slice(0, 10).map(member => (
+              <button key={member.id} onClick={() => {
+                const before = messageInput.slice(0, mentionStart)
+                const after = messageInput.slice(mentionStart + mentionQuery.length + 1)
+                setMessageInput(`${before}@${member.username}${after}`)
+                setShowMentionDropdown(false)
+                textInputRef.current?.focus()
+              }} className="w-full px-3 py-2 text-left hover:bg-[#292b3d] flex items-center gap-2">
+                <UserAvatar user={member} size="sm" />
+                <span className="text-[#cdd6f4] text-sm">{member.displayName || member.username}</span>
+              </button>
+            ))}
           </div>
         )}
 
@@ -509,7 +436,7 @@ export function ChatArea({
           <div className="bg-[#313244] rounded-lg cursor-text" onClick={handleContainerClick}>
             {isRecording ? (
               <div className="flex items-center gap-4 px-4 py-3">
-                <motion.div animate={{ scale: [1, 1.2, 1] }} transition={{ repeat: Infinity, duration: 1 }} className="w-3 h-3 bg-red-500 rounded-full" />
+                <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
                 <span className="text-red-400 font-medium">{t('chat.recording')}</span>
                 <span className="text-[#cdd6f4] font-mono">{formatDuration(recordingDuration)}</span>
                 <div className="flex-1" />
@@ -518,43 +445,22 @@ export function ChatArea({
               </div>
             ) : (
               <div className="flex items-center gap-2 px-4">
-                <button onClick={() => fileInputRef.current?.click()} className="text-[#bac2de] hover:text-[#cdd6f4] transition-colors p-2" title={t('chat.attachFiles')} disabled={isUploading}><PaperclipIcon className="w-5 h-5" /></button>
+                <button onClick={() => fileInputRef.current?.click()} className="text-[#bac2de] hover:text-[#cdd6f4] transition-colors p-2" title={t('chat.attachFiles')}><PaperclipIcon className="w-5 h-5" /></button>
                 <input ref={fileInputRef} type="file" multiple onChange={handleFileSelect} className="hidden" />
-                <input ref={textInputRef} type="text" value={messageInput} onChange={(e) => setMessageInput(e.target.value)} onKeyPress={handleKeyPress}
-                  placeholder={isUploading ? 'Uploading...' : `${t('chat.messagePlaceholder')} ${isDM ? '@' + channel.name : '#' + channel.name}`}
-                  disabled={isUploading}
-                  className="flex-1 bg-transparent text-[#cdd6f4] placeholder-[#6c7086] py-3 focus:outline-none disabled:opacity-50" />
+                <input ref={textInputRef} type="text" value={messageInput} onChange={handleInputChange} onKeyPress={handleKeyPress}
+                  placeholder={`${t('chat.messagePlaceholder')} ${isDM ? '@' + channel.name : '#' + channel.name}`}
+                  className="flex-1 bg-transparent text-[#cdd6f4] placeholder-[#6c7086] py-3 focus:outline-none" />
                 <div className="flex items-center gap-1">
-                  {isUploading ? (
-                    <div className="flex items-center gap-2 px-2">
-                      <div className="w-4 h-4 border-2 border-[#cba6f7] border-t-transparent rounded-full animate-spin" />
-                      <span className="text-xs text-[#6c7086]">Uploading...</span>
-                    </div>
-                  ) : (
-                    <>
-                      <button onClick={() => { setShowGifStickerPicker(!showGifStickerPicker); setShowEmojiPicker(false) }} className={`transition-colors p-2 ${showGifStickerPicker ? 'text-[#cba6f7]' : 'text-[#bac2de] hover:text-[#cdd6f4]'}`} title="GIF & Stickers"><StickerIcon className="w-5 h-5" /></button>
-                      <button onClick={() => { setShowEmojiPicker(!showEmojiPicker); setShowGifStickerPicker(false) }} className={`transition-colors p-2 ${showEmojiPicker ? 'text-[#cba6f7]' : 'text-[#bac2de] hover:text-[#cdd6f4]'}`} title={t('chat.emoji')}><SmileIcon className="w-5 h-5" /></button>
-                      <button onClick={startRecording} className="text-[#bac2de] hover:text-[#cdd6f4] transition-colors p-2" title={t('chat.recordVoice')}><MicIcon className="w-5 h-5" /></button>
-                      {(messageInput.trim() || attachedFiles.length > 0) && <button onClick={handleSend} className="text-[#cba6f7] hover:text-[#b4befe] transition-colors p-2"><SendIcon className="w-5 h-5" /></button>}
-                    </>
-                  )}
+                  <button onClick={() => { setShowGifStickerPicker(!showGifStickerPicker); setShowEmojiPicker(false) }} className={`transition-colors p-2 ${showGifStickerPicker ? 'text-[#cba6f7]' : 'text-[#bac2de] hover:text-[#cdd6f4]'}`} title="GIF & Stickers"><StickerIcon className="w-5 h-5" /></button>
+                  <button onClick={() => { setShowEmojiPicker(!showEmojiPicker); setShowGifStickerPicker(false) }} className={`transition-colors p-2 ${showEmojiPicker ? 'text-[#cba6f7]' : 'text-[#bac2de] hover:text-[#cdd6f4]'}`} title={t('chat.emoji')}><SmileIcon className="w-5 h-5" /></button>
+                  <button onClick={startRecording} className="text-[#bac2de] hover:text-[#cdd6f4] transition-colors p-2" title={t('chat.recordVoice')}><MicIcon className="w-5 h-5" /></button>
+                  {(messageInput.trim() || attachedFiles.length > 0) && <button onClick={handleSend} className="text-[#cba6f7] hover:text-[#b4befe] transition-colors p-2"><SendIcon className="w-5 h-5" /></button>}
                 </div>
               </div>
             )}
           </div>
         )}
       </div>
-      </div>
-      {/* DM Profile Panel */}
-      {isDM && dmUser && showDMProfile && (
-        <DMProfilePanel
-          dmUser={dmUser}
-          currentUserId={currentUser.id}
-          onStartCall={onStartCall}
-          presenceMap={presenceMap}
-          onClose={() => setShowDMProfile(false)}
-        />
-      )}
     </div>
   )
 }

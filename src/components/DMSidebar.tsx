@@ -30,10 +30,8 @@ interface DMSidebarProps {
   onCustomStatusChange: (text: string) => void
   onToggleScreenShare?: () => void
   onToggleCamera?: () => void
-  onToggleStreaming?: () => void
   isScreenSharing?: boolean
   isCameraOn?: boolean
-  isStreaming?: boolean
   callStartTime?: number | null
   onCreateGroupDM?: () => void
   selectedGroupDMId?: string | null
@@ -63,7 +61,7 @@ export function DMSidebar({
   currentUser, onOpenSettings, isMuted, isDeafened, onToggleMute, onToggleDeafen,
   connectedVoice, onDisconnect, onProfileClick, selectedDMUserId, onSelectDM,
   onStatusChange, onCustomStatusChange, onToggleScreenShare, onToggleCamera,
-  onToggleStreaming, isStreaming, isScreenSharing, isCameraOn, callStartTime, onCreateGroupDM,
+  isScreenSharing, isCameraOn, callStartTime, onCreateGroupDM,
   selectedGroupDMId, onSelectGroupDM, onBack, presenceMap: presenceMapProp = {},
   unreadCounts = {}, voiceStates = [], currentUserId = '',
 }: DMSidebarProps) {
@@ -108,14 +106,24 @@ export function DMSidebar({
 
   // ✅ دالة تجيب الـ status الحقيقي من RTDB
   const getUserPresence = (userId: string, fallbackUser: StoredUser) => {
-    // حوّل الـ presenceMapProp (string) لـ object
-    const statusStr = presenceMapProp[userId] as any
-    const presence = typeof statusStr === 'string' ? { status: statusStr } : statusStr
-    if (!presence) return { status: fallbackUser.status, customStatus: fallbackUser.customStatus }
+    // ✅ RTDB presenceMap هو المصدر الوحيد الموثوق للـ status
+    const rtdbStatus = presenceMapProp[userId] as StoredUser['status'] | undefined
+    // لو RTDB اتحمل (فيه أي entries) → نثق فيه بالكامل
+    const presenceLoaded = Object.keys(presenceMapProp).length > 0
+
+    if (rtdbStatus) {
+      // جاء من RTDB → موثوق 100%
+      return {
+        status: rtdbStatus,
+        customStatus: rtdbStatus === 'offline' ? undefined : fallbackUser.customStatus,
+      }
+    }
+    // لو RTDB اتحمل ومفيش record → offline فعلاً
+    // لو RTDB لسه فاضي → Firestore كـ fallback مؤقت
+    const fallbackStatus = presenceLoaded ? ('offline' as const) : ((fallbackUser.status || 'offline') as StoredUser['status'])
     return {
-      status: presence.status as StoredUser['status'],
-      // لو offline → اخفي الـ customStatus
-      customStatus: presence.status === 'offline' ? undefined : fallbackUser.customStatus,
+      status: fallbackStatus,
+      customStatus: fallbackStatus === 'offline' ? undefined : fallbackUser.customStatus,
     }
   }
 
@@ -212,7 +220,7 @@ export function DMSidebar({
   }
 
   const filteredDmUsers = dmUsers.filter(
-    (u) => u.username.toLowerCase().includes(searchQuery.toLowerCase()) || u.displayName.toLowerCase().includes(searchQuery.toLowerCase())
+    (u) => (u.username || '').toLowerCase().includes(searchQuery.toLowerCase()) || (u.displayName || '').toLowerCase().includes(searchQuery.toLowerCase())
   )
 
   const sortedDmUsers = [...filteredDmUsers].sort((a, b) => {
@@ -228,7 +236,7 @@ export function DMSidebar({
     return 0
   })
 
-  const filteredGroupDMs = groupDMs.filter((g) => g.name.toLowerCase().includes(searchQuery.toLowerCase()))
+  const filteredGroupDMs = groupDMs.filter((g) => (g.name || '').toLowerCase().includes(searchQuery.toLowerCase()))
   const categorizedDmIds = new Set(categories.flatMap((c) => c.dmIds))
   const uncategorizedUsers = sortedDmUsers.filter((u) => !categorizedDmIds.has(u.id))
   const uncategorizedGroups = filteredGroupDMs.filter((g) => !categorizedDmIds.has(g.id))
@@ -253,7 +261,7 @@ export function DMSidebar({
     return (
       <div key={user.id} onClick={() => onSelectDM(user.id)} onContextMenu={(e) => handleContextMenu(e, 'user', user.id)}
         className={`flex items-center gap-3 px-2 py-1.5 rounded cursor-pointer group relative ${isActive ? 'bg-[#313244] text-[#cdd6f4]' : 'text-[#9399b2] hover:bg-[#1e1e2e] hover:text-[#cdd6f4]'}`}>
-        <UserAvatar user={{ ...user, status }} size="sm" showStatus />
+        <UserAvatar user={{ ...user, status }} size="sm" showStatus context="message" />
         <div className="flex-1 min-w-0">
           <div className="font-medium truncate flex items-center gap-1">
             {user.username}
@@ -290,14 +298,35 @@ export function DMSidebar({
   }
 
   const renderGroupDM = (group: GroupDM) => {
-    const memberUsers = group.memberIds.filter((id) => id !== currentUser.id).map((id) => friends.find((f) => f.id === id)).filter(Boolean) as StoredUser[]
+    // ✅ نجيب الـ members من friends أو dmUsers كـ fallback
+    const memberUsers = group.memberIds
+      .filter((id) => id !== currentUser.id)
+      .map((id) => friends.find((f) => f.id === id) || dmUsers.find((u) => u.id === id))
+      .filter(Boolean) as StoredUser[]
     const isActive = selectedGroupDMId === group.id
+    const displayName = group.name || memberUsers.map(m => m.displayName || m.username).join(', ') || 'Group'
     return (
       <div key={group.id} onClick={() => onSelectGroupDM && onSelectGroupDM(group.id)} onContextMenu={(e) => handleContextMenu(e, 'group', group.id)}
-        className={`flex items-center gap-2.5 px-2 py-1.5 rounded cursor-pointer group relative ${isActive ? 'bg-[#313244] text-[#cdd6f4]' : 'text-[#9399b2] hover:bg-[#1e1e2e] hover:text-[#cdd6f4]'}`}>
-        <StackedAvatars members={memberUsers} />
+        className={`flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer group relative overflow-hidden ${isActive ? 'bg-[#313244] text-[#cdd6f4]' : 'text-[#9399b2] hover:bg-[#1e1e2e] hover:text-[#cdd6f4]'}`}>
+        {/* Group avatar - fixed 32x32 flex-shrink-0 عشان ما يغطيش النص */}
+        <div className="w-8 h-8 flex-shrink-0 relative">
+          {group.icon ? (
+            <img src={group.icon} alt="" className="w-8 h-8 rounded-full object-cover" />
+          ) : memberUsers.length >= 2 ? (
+            <div className="w-8 h-8 relative">
+              <div className="absolute bottom-0 left-0 w-5 h-5 rounded-full border-2 border-[#181825] overflow-hidden flex items-center justify-center text-white text-[8px] font-bold" style={{ backgroundColor: memberUsers[1]?.avatarColor || '#cba6f7', zIndex: 1 }}>
+                {memberUsers[1]?.avatar ? <img src={memberUsers[1].avatar} className="w-full h-full object-cover" alt="" /> : (memberUsers[1]?.username || '?').substring(0, 2).toUpperCase()}
+              </div>
+              <div className="absolute top-0 right-0 w-5 h-5 rounded-full border-2 border-[#181825] overflow-hidden flex items-center justify-center text-white text-[8px] font-bold" style={{ backgroundColor: memberUsers[0]?.avatarColor || '#cba6f7', zIndex: 2 }}>
+                {memberUsers[0]?.avatar ? <img src={memberUsers[0].avatar} className="w-full h-full object-cover" alt="" /> : (memberUsers[0]?.username || '?').substring(0, 2).toUpperCase()}
+              </div>
+            </div>
+          ) : (
+            <div className="w-8 h-8 rounded-full bg-[#cba6f7] flex items-center justify-center text-white text-xs font-bold">{displayName.substring(0, 2).toUpperCase()}</div>
+          )}
+        </div>
         <div className="flex-1 min-w-0">
-          <div className="font-medium truncate text-sm">{group.name}</div>
+          <div className="font-medium truncate text-sm">{displayName}</div>
           <div className="text-[10px] truncate opacity-60">{group.memberIds.length} {t('groupDM.members')}</div>
         </div>
       </div>
@@ -434,7 +463,7 @@ export function DMSidebar({
                   const { status } = getUserPresence(user.id, user)
                   return (
                     <div key={user.id} onClick={() => startDMWithUser(user)} className="flex items-center gap-3 px-3 py-2 rounded cursor-pointer hover:bg-[#313244]">
-                      <UserAvatar user={{ ...user, status }} size="sm" showStatus />
+                      <UserAvatar user={{ ...user, status }} size="sm" showStatus context="other" />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-1.5">
                           <p className="text-sm text-[#cdd6f4] font-medium truncate">{user.displayName || user.username}</p>
@@ -456,15 +485,14 @@ export function DMSidebar({
           onDisconnect={onDisconnect} isMuted={isMuted} isDeafened={isDeafened}
           onToggleMute={onToggleMute} onToggleDeafen={onToggleDeafen}
           onToggleScreenShare={onToggleScreenShare} onToggleCamera={onToggleCamera}
-          onToggleStreaming={onToggleStreaming} isScreenSharing={isScreenSharing}
-          isCameraOn={isCameraOn} isStreaming={isStreaming}
+          isScreenSharing={isScreenSharing} isCameraOn={isCameraOn}
           joinedAt={callStartTime ?? connectedVoice.joinedAt} />
       )}
 
       <div className="h-[46px] md:h-[52px] bg-[#181825] px-2 flex items-center gap-1.5 md:gap-2 flex-shrink-0 relative">
         <div className="flex items-center gap-2 flex-1 min-w-0 rounded px-1 py-0.5">
           <div onClick={(e) => { e.stopPropagation(); setShowStatusPicker(!showStatusPicker) }} className="relative cursor-pointer flex-shrink-0">
-            <UserAvatar user={currentUser} size="sm" showStatus />
+            <UserAvatar user={currentUser} size="sm" showStatus context="other" />
           </div>
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium text-[#cdd6f4] truncate cursor-pointer hover:underline" onClick={(e) => { e.stopPropagation(); onProfileClick?.(e) }}>{currentUser.displayName}</p>

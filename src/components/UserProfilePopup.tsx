@@ -18,11 +18,12 @@ interface UserProfilePopupProps {
   onStartCall?: (userId: string) => void;
   currentUserId?: string;
   presenceMap?: Record<string, string>;
+  rolesMap?: Record<string, Role[]>;
 }
 
 export function UserProfilePopup({
   user, position, onClose, serverId, onOpenDM, onStartCall,
-  currentUserId = '', presenceMap = {},
+  currentUserId = '', presenceMap = {}, rolesMap = {},
 }: UserProfilePopupProps) {
   const { t } = useI18n();
   const popupRef = useRef<HTMLDivElement>(null);
@@ -38,6 +39,10 @@ export function UserProfilePopup({
   const [mutualFriends, setMutualFriends] = useState<StoredUser[]>([]);
   const [showMutualServers, setShowMutualServers] = useState(false);
   const [showMutualFriends, setShowMutualFriends] = useState(false);
+  const [userRoles, setUserRoles] = useState<any[]>([]);
+  const [currentUserRoles, setCurrentUserRoles] = useState<any[]>([]);
+  const [showAddRole, setShowAddRole] = useState(false);
+  const [allRoles, setAllRoles] = useState<any[]>([]);
 
   useEffect(() => {
     setIsLoaded(false); setIsFriend(false); setIsPending(false); setCanAddFriend(false);
@@ -65,6 +70,14 @@ export function UserProfilePopup({
       setIsPending(pendingFound); setCanAddFriend(addAllowed);
       if (profile) setServerProfile(profile);
 
+      // Set roles from rolesMap
+      if (serverId) {
+        const serverRoles = rolesMap[serverId] || [];
+        setUserRoles(serverRoles.filter(r => r.memberIds?.includes(user.id)));
+        setCurrentUserRoles(serverRoles.filter(r => r.memberIds?.includes(currentUserId)));
+        setAllRoles(serverRoles);
+      }
+
       // Mutual
       const [myServers, theirServers, myFriends, theirFriends] = await Promise.all([
         db.getServers(currentUserId), db.getServers(user.id),
@@ -81,6 +94,15 @@ export function UserProfilePopup({
     syncChannel.addEventListener('message', handleSync);
     return () => syncChannel.removeEventListener('message', handleSync);
   }, [user.id, currentUserId, serverId]);
+
+  // Listen for roles updates
+  useEffect(() => {
+    if (!serverId || !rolesMap[serverId]) return;
+    const serverRoles = rolesMap[serverId];
+    setUserRoles(serverRoles.filter(r => r.memberIds?.includes(user.id)));
+    setCurrentUserRoles(serverRoles.filter(r => r.memberIds?.includes(currentUserId)));
+    setAllRoles(serverRoles);
+  }, [serverId, rolesMap, user.id, currentUserId]);
 
   useEffect(() => {
     const handler = (e: MouseEvent) => { if (popupRef.current && !popupRef.current.contains(e.target as Node)) onClose(); };
@@ -123,10 +145,37 @@ export function UserProfilePopup({
   const statusColors: Record<string, string> = { online: '#a6e3a1', idle: '#f9e2af', dnd: '#f38ba8', offline: '#6c7086' };
   const statusText: Record<string, string> = { online: 'Online', idle: 'Idle', dnd: 'Do Not Disturb', offline: 'Offline' };
 
+  const canManageRoles = serverId && currentUserRoles.some((r) => r.permissions.administrator || r.permissions.manageRoles);
+
   const handleAddFriend = async () => { await db.sendFriendRequest(currentUserId, user.id); setIsFriend(true); };
   const handleRemoveFriend = async () => { await db.removeFriend(currentUserId, user.id); setIsFriend(false); };
   const handleBlock = async () => { await db.blockUser(currentUserId, user.id); setIsBlocked(true); };
   const handleUnblock = async () => { await db.unblockUser(currentUserId, user.id); setIsBlocked(false); };
+
+  const handleAddRole = async (roleId: string) => {
+    if (!serverId) return;
+    try {
+      await db.addMemberToRole(serverId, roleId, user.id);
+      // Refresh roles
+      const updatedRoles = await db.getMemberRoles(serverId, user.id);
+      setUserRoles(updatedRoles);
+      setShowAddRole(false);
+    } catch (error) {
+      console.error('Failed to add role:', error);
+    }
+  };
+
+  const handleRemoveRole = async (roleId: string) => {
+    if (!serverId) return;
+    try {
+      await db.removeMemberFromRole(serverId, roleId, user.id);
+      // Refresh roles
+      const updatedRoles = await db.getMemberRoles(serverId, user.id);
+      setUserRoles(updatedRoles);
+    } catch (error) {
+      console.error('Failed to remove role:', error);
+    }
+  };
 
   return (
     <>
@@ -145,7 +194,7 @@ export function UserProfilePopup({
           <div className="absolute -top-8 left-4">
             <div className="relative">
               <div className="w-16 h-16 rounded-full border-4 border-[#1e1e2e] overflow-hidden">
-                <UserAvatar user={{ ...user, avatar: avatarToShow, status: liveStatus }} size="xl" className="w-full h-full" />
+                <UserAvatar user={{ ...user, avatar: avatarToShow, status: liveStatus }} size="xl" className="w-full h-full" context="profile" />
               </div>
               <div className="absolute bottom-1 right-1 w-4 h-4 rounded-full border-2 border-[#1e1e2e]"
                 style={{ backgroundColor: statusColors[liveStatus] || statusColors.offline }} />
@@ -187,7 +236,7 @@ export function UserProfilePopup({
           {/* Name */}
           <div className="px-4 pt-4 pb-3">
             <h3 className="text-[#cdd6f4] font-bold text-lg leading-tight">{displayName}</h3>
-            <p className="text-[#a6adc8] text-sm">@{storedUser?.username || user.username}</p>
+            <p className="text-[#a6adc8] text-sm">@{storedUser?.username || user.username}#{storedUser?.discriminator || user.discriminator}</p>
             {customStatus && <p className="text-[#6c7086] text-xs mt-1 truncate">{customStatus}</p>}
             {serverProfile?.nickname && serverProfile.nickname !== (storedUser?.displayName || user.displayName) && (
               <p className="text-[#6c7086] text-xs mt-0.5">{t('profile.aka')} {storedUser?.displayName || user.displayName}</p>
@@ -219,6 +268,53 @@ export function UserProfilePopup({
             <p className="text-[#a6adc8] text-xs font-semibold uppercase tracking-wide mb-1">Member Since</p>
             <p className="text-[#cdd6f4] text-sm">{new Date(user.joinedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</p>
           </div>
+
+          {/* Roles */}
+          {serverId && (userRoles.length > 0 || canManageRoles) && (
+            <>
+              <div className="h-px bg-[#313244]" />
+              <div className="px-4 py-3">
+                <p className="text-[#a6adc8] text-xs font-semibold uppercase tracking-wide mb-1">{t('profile.roles')}</p>
+                <div className="flex flex-wrap gap-1 items-center">
+                  {userRoles.length === 0 && !canManageRoles ? (
+                    <span className="text-[#6c7086] text-xs">{t('profile.noRoles')}</span>
+                  ) : (
+                    userRoles.map(role => (
+                      <div key={role.id} className="relative group">
+                        <span className="px-2 py-0.5 rounded text-xs font-medium" style={{ backgroundColor: role.color + '20', color: role.color }}>
+                          {role.name}
+                        </span>
+                        {canManageRoles && (
+                          <button
+                            onClick={() => handleRemoveRole(role.id)}
+                            className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-500 text-white text-xs opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center hover:bg-red-600"
+                          >
+                            ×
+                          </button>
+                        )}
+                      </div>
+                    ))
+                  )}
+                  {canManageRoles && (
+                    <button onClick={() => setShowAddRole(!showAddRole)}
+                      className="w-6 h-6 rounded-full bg-[#313244] hover:bg-[#45475a] text-[#bac2de] hover:text-[#cdd6f4] flex items-center justify-center transition-colors flex-shrink-0">
+                      <span className="text-sm font-bold">+</span>
+                    </button>
+                  )}
+                </div>
+                {showAddRole && (
+                  <div className="mt-2 space-y-1">
+                    {allRoles.filter(role => !userRoles.some(ur => ur.id === role.id)).map(role => (
+                      <button key={role.id} onClick={() => handleAddRole(role.id)}
+                        className="w-full text-left px-2 py-1 rounded text-xs hover:bg-[#313244] transition-colors" style={{ color: role.color }}>
+                        + {role.name}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
 
           {/* Mutual Servers - مش بتظهر لو بروفايل نفسنا */}
           {!isOwnProfile && mutualServers.length > 0 && (
@@ -259,13 +355,13 @@ export function UserProfilePopup({
                   {mutualFriends.map(friend => (
                     <div key={friend.id} className="flex items-center gap-2.5 px-2 py-1.5 rounded-lg hover:bg-[#313244] transition-colors">
                       <div className="relative flex-shrink-0">
-                        <UserAvatar user={friend} size="sm" />
+                        <UserAvatar user={friend} size="sm" context="other" />
                         <div className="absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-[#181825]"
                           style={{ backgroundColor: statusColors[(presenceMap[friend.id] as any) || friend.status] || statusColors.offline }} />
                       </div>
                       <div className="min-w-0">
                         <p className="text-[#cdd6f4] text-sm font-medium truncate">{friend.displayName}</p>
-                        <p className="text-[#6c7086] text-xs truncate">@{friend.username}</p>
+                        <p className="text-[#6c7086] text-xs truncate">@{friend.username}#{friend.discriminator}</p>
                       </div>
                     </div>
                   ))}

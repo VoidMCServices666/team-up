@@ -93,7 +93,6 @@ export interface GroupDM {
   memberIds: string[]
   createdBy: string
   createdAt: number
-  icon?: string
 }
 
 export interface UserPrivacySettings {
@@ -246,32 +245,6 @@ export const db = {
   async addServerMember(serverId: string, userId: string) {
     await setDoc(doc(firestore, 'server_members', `${serverId}_${userId}`), { serverId, userId })
     syncChannel.postMessage({ type: 'servers_updated' })
-
-    // Auto-assign @everyone role if exists
-    let roles = await db.getRoles(serverId)
-    let everyoneRole = roles.find((role) => ['@everyone', 'everyone'].includes(role.name.toLowerCase()))
-
-    if (!everyoneRole) {
-      const roleId = crypto.randomUUID()
-      everyoneRole = {
-        id: roleId,
-        serverId,
-        name: '@everyone',
-        color: '#94a3b8',
-        position: 0,
-        hoist: false,
-        permissions: { ...DEFAULT_ROLE_PERMISSIONS },
-        memberIds: [],
-      }
-      await db.saveRole(everyoneRole)
-      roles = await db.getRoles(serverId)
-      everyoneRole = roles.find((role) => role.id === roleId) || everyoneRole
-    }
-
-    if (!everyoneRole.memberIds) everyoneRole.memberIds = []
-    if (!everyoneRole.memberIds.includes(userId)) {
-      await db.addMemberToRole(serverId, everyoneRole.id, userId)
-    }
   },
 
   async saveChannel(channel: Channel, serverId: string, position: number = 0) {
@@ -467,6 +440,7 @@ export const db = {
 
   async setVoiceState(state: VoiceState) {
     await setDoc(doc(firestore, 'voice_states', state.userId), state)
+    // ✅ mirror to RTDB عشان الـ onDisconnect يشتغل
     try {
       const { ref: rtdbRef, set: rtdbSet } = await import('firebase/database')
       const { rtdb } = await import('./firebase')
@@ -479,6 +453,7 @@ export const db = {
 
   async removeVoiceState(userId: string) {
     await deleteDoc(doc(firestore, 'voice_states', userId))
+    // ✅ remove from RTDB كمان
     try {
       const { ref: rtdbRef, remove: rtdbRemove } = await import('firebase/database')
       const { rtdb } = await import('./firebase')
@@ -586,27 +561,6 @@ export const db = {
   async getMemberRoles(serverId: string, userId: string): Promise<Role[]> {
     const roles = await db.getRoles(serverId)
     return roles.filter((r) => r.memberIds?.includes(userId))
-  },
-
-  async addMemberToRole(serverId: string, roleId: string, userId: string) {
-    const role = await db.getRole(roleId)
-    if (!role || role.serverId !== serverId) throw new Error('Role not found')
-    if (!role.memberIds) role.memberIds = []
-    if (!role.memberIds.includes(userId)) {
-      role.memberIds.push(userId)
-      await db.saveRole(role)
-      syncChannel.postMessage({ type: 'roles_updated', serverId })
-    }
-  },
-
-  async removeMemberFromRole(serverId: string, roleId: string, userId: string) {
-    const role = await db.getRole(roleId)
-    if (!role || role.serverId !== serverId) throw new Error('Role not found')
-    if (role.memberIds) {
-      role.memberIds = role.memberIds.filter(id => id !== userId)
-      await db.saveRole(role)
-      syncChannel.postMessage({ type: 'roles_updated', serverId })
-    }
   },
 
   async getPrivacySettings(userId: string): Promise<UserPrivacySettings> {
@@ -737,131 +691,49 @@ export const db = {
     localStorage.setItem(`teamup_saved_gifs_${userId}`, JSON.stringify(gifs))
   },
 
-  // Local storage for messages
-  getCachedMessages(contextId: string): Message[] {
-    try {
-      const cached = localStorage.getItem(`teamup_messages_${contextId}`)
-      return cached ? JSON.parse(cached) : []
-    } catch {
-      return []
-    }
-  },
-
-  saveCachedMessages(contextId: string, messages: Message[]): void {
-    try {
-      localStorage.setItem(`teamup_messages_${contextId}`, JSON.stringify(messages.slice(-100))) // Keep last 100 messages
-    } catch (e) {
-      // localStorage full, ignore
-    }
-  },
-
-  // Local storage for servers and users
-  getCachedServers(): Server[] | null {
-    try {
-      const cached = localStorage.getItem('teamup_servers')
-      return cached ? JSON.parse(cached) : null
-    } catch {
-      return null
-    }
-  },
-
-  saveCachedServers(servers: Server[]): void {
-    try {
-      localStorage.setItem('teamup_servers', JSON.stringify(servers))
-    } catch (e) {
-      // localStorage full, ignore
-    }
-  },
-
-  getCachedUsers(): StoredUser[] {
-    try {
-      const cached = localStorage.getItem('teamup_users')
-      return cached ? JSON.parse(cached) : []
-    } catch {
-      return []
-    }
-  },
-
-  saveCachedUsers(users: StoredUser[]): void {
-    try {
-      localStorage.setItem('teamup_users', JSON.stringify(users))
-    } catch (e) {
-      // localStorage full, ignore
-    }
-  },
-
   // ── Realtime Subscriptions ─────────────────────────────────────────────────
   subscribeToMessages(contextId: string, callback: (messages: Message[]) => void) {
-    // Load cached messages first
-    const cachedMessages = this.getCachedMessages(contextId)
-    if (cachedMessages.length > 0) {
-      callback(cachedMessages)
-    }
-
     const q = query(collection(firestore, 'messages'), where('contextId', '==', contextId), orderBy('timestamp'), limit(100))
-    return onSnapshot(q, (snap) => {
-      const messages = snap.docs.map((d) => docToMessage(d.data(), d.id))
-      this.saveCachedMessages(contextId, messages)
-      callback(messages)
+    return onSnapshot(q, (snap) => { 
+      callback(snap.docs.map((d) => docToMessage(d.data(), d.id))) 
+    }, (error) => {
+      console.error('[Firestore] Messages listener error:', error)
+      // يمكن إضافة منطق إعادة الاتصال هنا إذا لزم الأمر
     })
   },
 
   subscribeToVoiceStates(callback: (states: VoiceState[]) => void) {
-    return onSnapshot(collection(firestore, 'voice_states'), (snap) => { callback(snap.docs.map((d) => d.data() as VoiceState)) })
-  },
-
-  subscribeToServerRoles(serverId: string, callback: (roles: Role[]) => void) {
-    const q = query(collection(firestore, 'roles'), where('serverId', '==', serverId), orderBy('position', 'desc'))
-    return onSnapshot(q, (snap) => { callback(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Role))) })
+    return onSnapshot(collection(firestore, 'voice_states'), (snap) => { 
+      callback(snap.docs.map((d) => d.data() as VoiceState)) 
+    }, (error) => {
+      console.error('[Firestore] Voice states listener error:', error)
+    })
   },
 
   subscribeToFriendRequests(userId: string, callback: (requests: FriendRequest[]) => void) {
     const q = query(collection(firestore, 'friend_requests'), where('involvedIds', 'array-contains', userId), where('status', '==', 'pending'))
     return onSnapshot(q, (snap) => {
       callback(snap.docs.map((d) => ({ id: d.id, fromUserId: d.data().fromUserId, toUserId: d.data().toUserId, status: d.data().status, timestamp: d.data().createdAt?.toMillis?.() ?? Date.now() })))
-    })
-  },
-
-  subscribeToUsersStatus(userIds: string[], callback: (users: StoredUser[]) => void) {
-    if (userIds.length === 0) return () => {}
-    return onSnapshot(collection(firestore, 'profiles'), (snap) => {
-      const users = snap.docs.filter((d) => userIds.includes(d.id)).map((d) => docToUser(d.data(), d.id))
-      callback(users)
-    })
-  },
-
-  subscribeToFriends(userId: string, callback: (friends: StoredUser[]) => void) {
-    const q = query(collection(firestore, 'friendships'), where('userIds', 'array-contains', userId))
-    return onSnapshot(q, async (snap) => {
-      const friendIds = new Set<string>()
-      for (const docItem of snap.docs) {
-        const ids: string[] = docItem.data().userIds || []
-        ids.filter((one) => one !== userId).forEach((one) => friendIds.add(one))
-      }
-      const friends: StoredUser[] = []
-      for (const fid of friendIds) {
-        const user = await db.getUser(fid)
-        if (user) friends.push(user)
-      }
-      callback(friends)
     }, (error) => {
-      console.error('[Firestore] Friends listener error:', error)
+      console.error('[Firestore] Friend requests listener error:', error)
     })
   },
 
-  subscribeToBlockedUsers(userId: string, callback: (blockedUsers: StoredUser[]) => void) {
-    const q = query(collection(firestore, 'blocked_users'), where('blockerId', '==', userId))
-    return onSnapshot(q, async (snap) => {
-      const users: StoredUser[] = []
-      for (const docItem of snap.docs) {
-        const blockedId = docItem.data().blockedId
-        if (!blockedId) continue
-        const user = await db.getUser(blockedId)
-        if (user) users.push(user)
-      }
-      callback(users)
+  subscribeToServerRoles(serverId: string, callback: (roles: Role[]) => void) {
+    const q = query(collection(firestore, 'roles'), where('serverId', '==', serverId), orderBy('position', 'desc'))
+    return onSnapshot(q, (snap) => {
+      callback(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Role)))
     }, (error) => {
-      console.error('[Firestore] Blocked users listener error:', error)
+      console.error('[Firestore] Server roles listener error:', error)
+    })
+  },
+
+  subscribeToServerRoles(serverId: string, callback: (roles: Role[]) => void) {
+    const q = query(collection(firestore, 'roles'), where('serverId', '==', serverId), orderBy('position', 'desc'))
+    return onSnapshot(q, (snap) => {
+      callback(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Role)))
+    }, (error) => {
+      console.error('[Firestore] Server roles listener error:', error)
     })
   },
 }

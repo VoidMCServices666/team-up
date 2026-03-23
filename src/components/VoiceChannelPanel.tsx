@@ -1,438 +1,528 @@
-// src/components/VoiceChannelPanel.tsx
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef } from 'react'
 import {
-  Mic, MicOff, Headphones, Monitor, Video, VideoOff,
-  Settings, PhoneOff, Phone, ChevronDown, SlidersHorizontal,
-  MonitorOff, X, Volume2, Users, MoreHorizontal,
-} from 'lucide-react';
-import { UserAvatar } from './UserAvatar';
-import { ref, set } from 'firebase/database';
-import { rtdb } from '../lib/firebase';
-import type { Member, Channel } from '../App';
-import { useI18n } from '../lib/i18n';
-import { FloatingStream } from './FloatingStream';
+  MicIcon, MicOffIcon, HeadphonesIcon, MonitorIcon, VideoIcon,
+  VideoOffIcon, PhoneOffIcon, PhoneIcon, MonitorOffIcon, XIcon,
+  SlidersHorizontalIcon, ChevronDownIcon, SettingsIcon,
+} from 'lucide-react'
+import { UserAvatar } from './UserAvatar'
+import { db, syncChannel } from '../lib/database'
+import type { VoiceState } from '../lib/database'
+import type { Member, Channel } from '../App'
+import type { RemoteStream } from '../lib/livekitVoiceManager'
+import { useI18n } from '../lib/i18n'
 
 interface VoiceChannelPanelProps {
-  channel: Channel;
-  serverName: string;
-  currentUser: Member;
-  connectedUsers: Member[];
-  isMuted: boolean;
-  isDeafened: boolean;
-  onToggleMute: () => void;
-  onToggleDeafen: () => void;
-  onDisconnect: () => void;
-  onMemberClick?: (member: Member, e: React.MouseEvent) => void;
-  onToggleScreenShare?: () => void;
-  onToggleCamera?: () => void;
-  onToggleStreaming?: () => void;
-  onMuteUser?: (userId: string) => void;
-  onUnmuteUser?: (userId: string) => void;
-  isScreenSharing?: boolean;
-  isCameraOn?: boolean;
-  isStreaming?: boolean;
-  localCameraStream?: MediaStream | null;
-  localScreenStream?: MediaStream | null;
-  localStreamStream?: MediaStream | null;
-  remoteStreams?: { userId: string; stream: MediaStream; hasVideo: boolean }[];
-  mutedUserIds?: Set<string>;
-  isDMCall?: boolean;
-  pendingUsers?: Member[];
-  isIncomingCall?: boolean;
-  isObserving?: boolean;
-  onAcceptCall?: () => void;
-  onDeclineCall?: () => void;
-  onJoinCall?: () => void;
-  onOpenMobileMenu?: () => void;
+  channel: Channel
+  serverName: string
+  currentUser: Member
+  connectedUsers: Member[]
+  isMuted: boolean
+  isDeafened: boolean
+  onToggleMute: () => void
+  onToggleDeafen: () => void
+  onDisconnect: () => void
+  onMemberClick?: (member: Member, e: React.MouseEvent) => void
+  onToggleScreenShare?: () => void
+  onToggleCamera?: () => void
+  onMuteUser?: (userId: string) => void
+  onUnmuteUser?: (userId: string) => void
+  isScreenSharing?: boolean
+  isCameraOn?: boolean
+  localCameraStream?: MediaStream | null
+  localScreenStream?: MediaStream | null
+  remoteStreams?: RemoteStream[]
+  mutedUserIds?: Set<string>
+  isDMCall?: boolean
+  pendingUsers?: Member[]
+  isIncomingCall?: boolean
+  isObserving?: boolean
+  onAcceptCall?: () => void
+  onDeclineCall?: () => void
+  onJoinCall?: () => void
+  onOpenMobileMenu?: () => void
 }
 
-type StreamQuality = '360p' | '480p' | '720p' | '1080p' | '1440p';
+type StreamQuality = '360p' | '480p' | '720p' | '1080p' | '1440p'
 
 function VideoTile({ stream, label, isMuted: tileMuted }: { stream: MediaStream; label: string; isMuted?: boolean }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  useEffect(() => { if (videoRef.current && stream) videoRef.current.srcObject = stream; }, [stream]);
+  const videoRef = useRef<HTMLVideoElement>(null)
+  useEffect(() => { if (videoRef.current && stream) videoRef.current.srcObject = stream }, [stream])
   return (
-    <div className="relative bg-[#11111b] rounded-xl overflow-hidden aspect-video">
+    <div className="relative bg-[#11111b] rounded-2xl overflow-hidden aspect-video ring-1 ring-white/5">
       <video ref={videoRef} autoPlay playsInline muted={tileMuted} className="w-full h-full object-cover" />
-      <div className="absolute bottom-2 left-2 bg-black/60 text-white text-xs px-2 py-1 rounded-lg backdrop-blur-sm">{label}</div>
+      <div className="absolute bottom-3 left-3 bg-black/50 backdrop-blur-sm text-white text-xs px-2.5 py-1 rounded-full font-medium">
+        {label}
+      </div>
     </div>
-  );
+  )
 }
 
-function CallTimer({ startTime }: { startTime: number }) {
-  const [elapsed, setElapsed] = useState(0);
-  useEffect(() => {
-    const interval = setInterval(() => setElapsed(Math.floor((Date.now() - startTime) / 1000)), 1000);
-    return () => clearInterval(interval);
-  }, [startTime]);
-  const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
-  const secs = (elapsed % 60).toString().padStart(2, '0');
-  return <span className="text-[#a6adc8] text-sm font-mono">{mins}:{secs}</span>;
+// ── Circular control button ───────────────────────────────────────────────────
+function CtrlBtn({
+  onClick, active, activeColor = 'bg-[#f38ba8]', icon: Icon, title, size = 'md',
+}: {
+  onClick?: () => void; active?: boolean; activeColor?: string
+  icon: React.ElementType; title?: string; size?: 'sm' | 'md' | 'lg'
+}) {
+  const dim = size === 'lg' ? 'w-16 h-16' : size === 'sm' ? 'w-9 h-9' : 'w-12 h-12'
+  const ico = size === 'lg' ? 'w-7 h-7' : size === 'sm' ? 'w-4 h-4' : 'w-5 h-5'
+  return (
+    <button onClick={onClick} title={title}
+      className={`${dim} rounded-full flex items-center justify-center transition-all duration-200 focus:outline-none
+        ${active ? `${activeColor} text-white shadow-lg` : 'bg-white/10 hover:bg-white/20 text-white/80 hover:text-white backdrop-blur-sm'}`}>
+      <Icon className={ico} />
+    </button>
+  )
 }
 
 export function VoiceChannelPanel({
-  channel, currentUser, connectedUsers, isMuted, isDeafened,
-  onToggleMute, onToggleDeafen, onDisconnect, onToggleScreenShare, onToggleCamera,
-  onMuteUser, onUnmuteUser, isScreenSharing = false, isCameraOn = false, isStreaming = false,
-  localCameraStream: propLocalCameraStream, localScreenStream: propLocalScreenStream,
-  localStreamStream: propLocalStreamStream,
-  remoteStreams = [], mutedUserIds = new Set(),
+  channel, serverName, currentUser, connectedUsers,
+  isMuted, isDeafened, onToggleMute, onToggleDeafen, onDisconnect,
+  onMemberClick, onToggleScreenShare, onToggleCamera, onMuteUser, onUnmuteUser,
+  isScreenSharing = false, isCameraOn = false,
+  localCameraStream, localScreenStream, remoteStreams = [], mutedUserIds = new Set(),
   isDMCall = false, pendingUsers = [], isIncomingCall = false, isObserving = false,
   onAcceptCall, onDeclineCall, onJoinCall, onOpenMobileMenu,
 }: VoiceChannelPanelProps) {
-  const { t } = useI18n();
-  const [streamQuality, setStreamQuality] = useState<StreamQuality>('720p');
-  const [showQualityDropdown, setShowQualityDropdown] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
-  const [inputVolume, setInputVolume] = useState(80);
-  const [outputVolume, setOutputVolume] = useState(100);
-  const [callDeclined, setCallDeclined] = useState(false);
-  const callStartTimeRef = useRef(Date.now());
-  const [speakingUserIds, setSpeakingUserIds] = useState<Set<string>>(new Set());
-  const [isMinimized, setIsMinimized] = useState(false);
+  const { t } = useI18n()
+  const [streamQuality, setStreamQuality] = useState<StreamQuality>('720p')
+  const [showQualityDropdown, setShowQualityDropdown] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
+  const [inputVolume, setInputVolume] = useState(80)
+  const [outputVolume, setOutputVolume] = useState(100)
+  const [callDeclined, setCallDeclined] = useState(false)
+  const callDeclinedProcessedRef = useRef(false)
+  const [speakingUserIds, setSpeakingUserIds] = useState<Set<string>>(new Set())
+  const [dbVoiceStates, setDbVoiceStates] = useState<VoiceState[]>([])
 
-  // حالات محلية للبث (إذا لم ترد من props)
-  const [localCameraStream, setLocalCameraStream] = useState<MediaStream | null>(propLocalCameraStream || null);
-  const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(propLocalScreenStream || null);
-  const [localStreamStream, setLocalStreamStream] = useState<MediaStream | null>(propLocalStreamStream || null);
-
-  // تحديث الحالات المحلية إذا تغيرت props
   useEffect(() => {
-    if (propLocalCameraStream !== localCameraStream) {
-      setLocalCameraStream(propLocalCameraStream);
+    if (!isDMCall || isIncomingCall || isObserving) return
+    const rejectionKey = `dc_call_rejected_${channel.id}`
+    const checkRejection = () => {
+      try {
+        const rejected = localStorage.getItem(rejectionKey)
+        if (rejected === 'true' && !callDeclinedProcessedRef.current) {
+          callDeclinedProcessedRef.current = true
+          localStorage.removeItem(rejectionKey)
+          setCallDeclined(true)
+          setTimeout(() => onDisconnect(), 2000)
+        }
+      } catch {}
     }
-  }, [propLocalCameraStream]);
-
-  useEffect(() => {
-    if (propLocalScreenStream !== localScreenStream) {
-      setLocalScreenStream(propLocalScreenStream);
+    checkRejection()
+    const handleSync = (event: MessageEvent) => {
+      if (event.data.type === 'call_rejected' && event.data.channelId === channel.id) checkRejection()
     }
-  }, [propLocalScreenStream]);
+    syncChannel.addEventListener('message', handleSync)
+    const pollInterval = setInterval(checkRejection, 500)
+    return () => { syncChannel.removeEventListener('message', handleSync); clearInterval(pollInterval); callDeclinedProcessedRef.current = false }
+  }, [channel.id, isDMCall, isIncomingCall, isObserving, onDisconnect])
 
   useEffect(() => {
-    if (propLocalStreamStream !== localStreamStream) {
-      setLocalStreamStream(propLocalStreamStream);
+    const updateStates = async () => {
+      const voiceStates = await db.getVoiceStates()
+      const speaking = new Set<string>()
+      voiceStates.forEach((vs) => { if (vs.isSpeaking && vs.channelId === channel.id) speaking.add(vs.userId) })
+      setSpeakingUserIds(speaking)
+      setDbVoiceStates(voiceStates.filter((vs) => vs.channelId === channel.id))
     }
-  }, [propLocalStreamStream]);
+    updateStates()
+    const handleSync = (event: MessageEvent) => {
+      if (event.data.type === 'speaking_updated' || event.data.type === 'voice_updated') updateStates()
+    }
+    syncChannel.addEventListener('message', handleSync)
+    const pollInterval = setInterval(updateStates, 300)
+    return () => { syncChannel.removeEventListener('message', handleSync); clearInterval(pollInterval) }
+  }, [channel.id])
 
-  // تحديث حالة المستخدم في Firebase
+  // Manage audio elements for remote streams
+  const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map())
+
   useEffect(() => {
-    if (!currentUser || !channel) return;
+    console.log('[VoiceChannelPanel] Remote streams changed, count:', remoteStreams.length)
+    
+    // Create or update audio elements for each remote stream
+    remoteStreams.forEach(rs => {
+      console.log('[VoiceChannelPanel] Processing stream for user:', rs.userId, 'audio tracks:', rs.stream.getAudioTracks().length)
+      
+      let audioEl = audioElementsRef.current.get(rs.userId)
+      
+      if (!audioEl) {
+        // Create new audio element
+        audioEl = document.createElement('audio')
+        audioEl.id = `audio-${rs.userId}`
+        document.body.appendChild(audioEl)
+        audioElementsRef.current.set(rs.userId, audioEl)
+        console.log('[VoiceChannelPanel] Created audio element for user:', rs.userId)
+      }
 
-    const userStatusRef = ref(rtdb, `voiceStates/${isDMCall ? 'dm' : 'server'}/${channel.id}/${currentUser.id}`);
-    set(userStatusRef, {
-      userId: currentUser.id,
-      joinedAt: Date.now(),
-      isMuted,
-      isDeafened,
-    });
+      // Set the stream
+      if (audioEl.srcObject !== rs.stream) {
+        audioEl.srcObject = rs.stream
+        const audioTracks = rs.stream.getAudioTracks()
+        console.log('[VoiceChannelPanel] Set srcObject for user:', rs.userId, {
+          audioTracks: audioTracks.length,
+          trackEnabled: audioTracks.length > 0 ? audioTracks[0].enabled : 'N/A',
+          trackState: audioTracks.length > 0 ? audioTracks[0].readyState : 'N/A'
+        })
+      }
 
-    return () => {
-      set(userStatusRef, null);
-    };
-  }, [currentUser, channel.id, isDMCall, isMuted, isDeafened]);
+      // Set volume
+      const volume = isDeafened ? 0 : (outputVolume / 100)
+      audioEl.volume = volume
+      
+      // Ensure autoplay
+      audioEl.autoplay = true
+      audioEl.playsInline = true
+      
+      // Try to play
+      const playPromise = audioEl.play()
+      if (playPromise) {
+        playPromise.then(() => {
+          console.log('[VoiceChannelPanel] Audio playing for user:', rs.userId)
+        }).catch(e => {
+          console.warn('[VoiceChannelPanel] Could not autoplay for', rs.userId, ':', e.message)
+          // On user interaction, try again
+          const playOnInteraction = () => {
+            audioEl?.play().then(() => {
+              console.log('[VoiceChannelPanel] Played audio for', rs.userId, 'after user click')
+            }).catch(err => console.error('[VoiceChannelPanel] Failed to play:', err))
+            document.removeEventListener('click', playOnInteraction)
+          }
+          document.addEventListener('click', playOnInteraction, { once: false })
+        })
+      }
+    })
 
+    // Clean up removed streams
+    const activeIds = new Set(remoteStreams.map(rs => rs.userId))
+    const idsToRemove: string[] = []
+    
+    audioElementsRef.current.forEach((audioEl, userId) => {
+      if (!activeIds.has(userId)) {
+        audioEl.pause()
+        audioEl.srcObject = null
+        audioEl.remove()
+        idsToRemove.push(userId)
+        console.log('[VoiceChannelPanel] Removed audio element for user:', userId)
+      }
+    })
 
+    idsToRemove.forEach(id => audioElementsRef.current.delete(id))
+  }, [remoteStreams, isDeafened, outputVolume])
 
-  const enhancedConnectedUsers = connectedUsers.map(user => ({
-    ...user,
-    isMuted: mutedUserIds.has(user.id) || false,
-    isDeafened: false,
-    isSpeaking: speakingUserIds.has(user.id),
-  }));
-
-  const hasAnyVideo = isCameraOn || isScreenSharing || isStreaming || remoteStreams.length > 0;
   const qualityOptions = [
-    { value: '360p', label: '360p', desc: 'Low quality — saves bandwidth' },
-    { value: '480p', label: '480p', desc: 'Standard quality' },
-    { value: '720p', label: '720p', desc: 'HD quality' },
-    { value: '1080p', label: '1080p', desc: 'Full HD quality' },
-    { value: '1440p', label: '1440p', desc: 'Highest quality' },
-  ];
+    { value: '360p' as StreamQuality, label: '360p', desc: 'Low quality' },
+    { value: '480p' as StreamQuality, label: '480p', desc: 'Standard quality' },
+    { value: '720p' as StreamQuality, label: '720p', desc: 'HD quality' },
+    { value: '1080p' as StreamQuality, label: '1080p', desc: 'Full HD' },
+    { value: '1440p' as StreamQuality, label: '1440p', desc: 'Highest quality' },
+  ]
 
-  // واجهة DM call
-  if (isDMCall) {
-    const otherUser = pendingUsers[0] || connectedUsers.find(u => u.id !== currentUser.id);
-    const isConnected = connectedUsers.length > 1;
+  const hasAnyVideo = isCameraOn || isScreenSharing || remoteStreams.some((s) => s.hasVideo)
+
+  // ── Avatar tile for audio-only users ─────────────────────────────────────
+  const AvatarTile = ({ user, isGrid = false }: { user: Member; isGrid?: boolean }) => {
+    const dbState = dbVoiceStates.find((vs) => vs.userId === user.id)
+    const isUserMuted = user.id === currentUser.id ? isMuted : dbState?.isMuted || mutedUserIds.has(user.id)
+    const isUserDeafened = user.id === currentUser.id ? isDeafened : dbState?.isDeafened || false
+    const isSpeaking = speakingUserIds.has(user.id)
+    const showRing = isSpeaking && !isUserMuted && !isUserDeafened && !isDeafened
+
+    if (isGrid) {
+      return (
+        <div className="relative bg-[#181825] rounded-2xl aspect-video flex flex-col items-center justify-center gap-3 ring-1 ring-white/5">
+          <div className={`relative rounded-full transition-all duration-200 ${showRing ? 'ring-4 ring-[#a6e3a1]/60 ring-offset-2 ring-offset-[#181825]' : ''}`}>
+            <UserAvatar user={user} size="xl" className="w-16 h-16 text-2xl" context="call" />
+            {isUserDeafened && (
+              <div className="absolute -bottom-1 -right-1 bg-[#f38ba8] rounded-full p-1 border-2 border-[#181825]">
+                <HeadphonesIcon className="w-3 h-3 text-white" />
+              </div>
+            )}
+            {!isUserDeafened && isUserMuted && (
+              <div className="absolute -bottom-1 -right-1 bg-[#f38ba8] rounded-full p-1 border-2 border-[#181825]">
+                <MicOffIcon className="w-3 h-3 text-white" />
+              </div>
+            )}
+          </div>
+          <span className="text-white/90 font-medium text-sm">{user.displayName}</span>
+        </div>
+      )
+    }
 
     return (
-      <div className="flex flex-col bg-[#2b2d31] min-w-0 h-full relative">
-        {hasAnyVideo && (
-          <div className="flex-1 overflow-y-auto custom-scrollbar bg-[#11111b] p-4">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 w-full h-full">
-              {isCameraOn && localCameraStream && (
-                <VideoTile stream={localCameraStream} label={`${currentUser.displayName} (You)`} isMuted />
-              )}
-              {isScreenSharing && localScreenStream && (
-                <VideoTile stream={localScreenStream} label={t('voice.yourScreen') || 'Your Screen'} isMuted />
-              )}
-              {isStreaming && localStreamStream && (
-                <VideoTile stream={localStreamStream} label={`${currentUser.displayName} (Streaming)`} isMuted />
-              )}
-              {remoteStreams.map((remoteStream) => {
-                const member = connectedUsers.find(u => u.id === remoteStream.userId);
-                const label = remoteStream.isStreaming 
-                  ? `${member?.displayName || remoteStream.userId} (Live)` 
-                  : member?.displayName || remoteStream.userId;
-                return <VideoTile key={remoteStream.userId} stream={remoteStream.stream} label={label} />;
-              })}
-            </div>
-          </div>
-        )}
-        <div className={`flex-1 flex items-center justify-between px-6 gap-4 min-h-0 ${hasAnyVideo ? 'flex-shrink-0 h-auto' : ''}`}>
-          <div className="relative flex-shrink-0">
-            {!isConnected && !callDeclined && !isIncomingCall && otherUser && (
-              [1, 2, 3].map((i) => (
-                <div key={i} className="absolute inset-0 rounded-full border-2 border-white/15"
-                  style={{ transform: `scale(${1 + i * 0.3})`, animation: `ping 2s ease-out infinite ${i * 0.5}s`, opacity: 0 }} />
-              ))
-            )}
-            {isConnected && otherUser && speakingUserIds.has(otherUser.id) && (
-              <div className="absolute -inset-1 rounded-full ring-2 ring-[#23a55a]" />
-            )}
-            <div className={`w-16 h-16 rounded-full overflow-hidden ${!isConnected && !callDeclined ? 'opacity-80' : ''}`}>
-              {otherUser
-                ? <UserAvatar user={otherUser} size="lg" className="w-16 h-16 text-2xl" />
-                : <div className="w-16 h-16 rounded-full bg-[#5865f2] flex items-center justify-center text-white text-2xl font-bold">{channel.name.substring(0, 1).toUpperCase()}</div>
-              }
-            </div>
-          </div>
-
-          <div className="flex-1 min-w-0">
-            <h2 className="text-white font-semibold text-base truncate">
-              {otherUser?.displayName || channel.name}
-            </h2>
-            <p className="text-sm mt-0.5">
-              {callDeclined ? <span className="text-[#f38ba8]">{t('voice.callDeclined')}</span>
-                : isIncomingCall ? <span className="text-[#b5bac1]">{t('voice.incomingCall')}</span>
-                : isObserving ? <span className="text-[#b5bac1]">{t('voice.callInProgress')}</span>
-                : isConnected ? <CallTimer startTime={callStartTimeRef.current} />
-                : <span className="text-[#b5bac1] flex items-center gap-1">{t('voice.calling')}<span className="calling-dots" /></span>
-              }
-            </p>
-          </div>
-
-          <button onClick={() => setShowSettings(!showSettings)} className={`p-2 rounded-full transition-colors flex-shrink-0 ${showSettings ? 'bg-[#404249] text-white' : 'text-[#b5bac1] hover:text-white hover:bg-[#404249]'}`}>
-            <SlidersHorizontal className="w-4 h-4" />
-          </button>
-
-          {showSettings && (
-            <div className="absolute top-2 right-14 w-64 bg-[#1e1f22] rounded-xl p-4 shadow-2xl border border-[#111214] z-10">
-              <div className="mb-3">
-                <label className="block text-[#b5bac1] text-xs font-semibold uppercase mb-2">{t('voice.inputVolumeLabel')}</label>
-                <div className="flex items-center gap-2">
-                  <Mic className="w-3.5 h-3.5 text-[#6c7086]" />
-                  <input type="range" min="0" max="100" value={inputVolume} onChange={(e) => setInputVolume(Number(e.target.value))} className="flex-1 accent-[#5865f2]" />
-                  <span className="text-xs text-[#b5bac1] w-7 text-right">{inputVolume}%</span>
-                </div>
-              </div>
-              <div>
-                <label className="block text-[#b5bac1] text-xs font-semibold uppercase mb-2">{t('voice.outputVolumeLabel')}</label>
-                <div className="flex items-center gap-2">
-                  <Headphones className="w-3.5 h-3.5 text-[#6c7086]" />
-                  <input type="range" min="0" max="100" value={outputVolume} onChange={(e) => setOutputVolume(Number(e.target.value))} className="flex-1 accent-[#5865f2]" />
-                  <span className="text-xs text-[#b5bac1] w-7 text-right">{outputVolume}%</span>
-                </div>
-              </div>
-            </div>
+      <div className="flex flex-col items-center gap-3 cursor-pointer group" onClick={(e) => onMemberClick?.(user, e)}>
+        {/* Outer glow ring */}
+        <div className={`relative p-1 rounded-full transition-all duration-300 ${showRing ? 'shadow-[0_0_0_3px_rgba(166,227,161,0.5),0_0_20px_rgba(166,227,161,0.25)]' : ''}`}>
+          {/* Animated ring */}
+          {showRing && (
+            <span className="absolute inset-0 rounded-full animate-ping bg-[#a6e3a1]/20" style={{ animationDuration: '1.5s' }} />
           )}
+          <div className="relative w-24 h-24">
+            <UserAvatar user={user} size="xl" className="w-24 h-24 text-4xl rounded-full" context="call" />
+            {/* Status badge */}
+            {isUserDeafened ? (
+              <div className="absolute -bottom-0.5 -right-0.5 bg-[#f38ba8] rounded-full p-1.5 border-[3px] border-[#11111b] shadow-lg">
+                <HeadphonesIcon className="w-3.5 h-3.5 text-white" />
+              </div>
+            ) : isUserMuted ? (
+              <div className="absolute -bottom-0.5 -right-0.5 bg-[#f38ba8] rounded-full p-1.5 border-[3px] border-[#11111b] shadow-lg">
+                <MicOffIcon className="w-3.5 h-3.5 text-white" />
+              </div>
+            ) : (
+              <div className="absolute -bottom-0.5 -right-0.5 w-4 h-4 bg-[#a6e3a1] rounded-full border-[3px] border-[#11111b]" />
+            )}
+          </div>
         </div>
-
-        <div className="bg-[#232428] border-t border-[#1e1f22] py-3 px-4 flex-shrink-0">
-          {callDeclined ? (
-            <div className="flex justify-center">
-              <span className="text-[#b5bac1] text-sm">{t('voice.disconnecting')}</span>
-            </div>
-          ) : isIncomingCall ? (
-            <div className="flex items-center justify-center gap-6">
-              <div className="flex flex-col items-center gap-1">
-                <button onClick={onAcceptCall} className="w-14 h-14 rounded-full bg-[#23a55a] hover:bg-[#1a8a47] text-white flex items-center justify-center transition-colors shadow-lg">
-                  <Phone className="w-6 h-6" />
-                </button>
-                <span className="text-xs text-[#b5bac1]">{t('voice.acceptCall')}</span>
-              </div>
-              <div className="flex flex-col items-center gap-1">
-                <button onClick={onDeclineCall} className="w-14 h-14 rounded-full bg-[#f23f43] hover:bg-[#da373c] text-white flex items-center justify-center transition-colors shadow-lg">
-                  <PhoneOff className="w-6 h-6" />
-                </button>
-                <span className="text-xs text-[#b5bac1]">{t('voice.declineCall')}</span>
-              </div>
-            </div>
-          ) : isObserving ? (
-            <div className="flex justify-center">
-              <button onClick={onJoinCall} className="h-12 px-8 rounded-full bg-[#23a55a] hover:bg-[#1a8a47] text-white flex items-center gap-2 font-medium transition-colors">
-                <Phone className="w-5 h-5" />{t('voice.joinCall')}
-              </button>
-            </div>
-          ) : (
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <div className="flex flex-col items-center gap-0.5">
-                  <button onClick={onToggleMute} className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${isMuted ? 'bg-[#f23f43] hover:bg-[#da373c] text-white' : 'bg-[#404249] hover:bg-[#4e5058] text-[#b5bac1] hover:text-white'}`}>
-                    {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-                  </button>
-                </div>
-                <div className="flex flex-col items-center gap-0.5">
-                  <button onClick={onToggleDeafen} className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors relative ${isDeafened ? 'bg-[#f23f43] hover:bg-[#da373c] text-white' : 'bg-[#404249] hover:bg-[#4e5058] text-[#b5bac1] hover:text-white'}`}>
-                    <Headphones className="w-5 h-5" />
-                    {isDeafened && <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-7 h-0.5 bg-white rotate-45 rounded" />}
-                  </button>
-                </div>
-                <div className="flex flex-col items-center gap-0.5">
-                  <button onClick={onToggleCamera} className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${isCameraOn ? 'bg-[#5865f2] hover:bg-[#4752c4] text-white' : 'bg-[#404249] hover:bg-[#4e5058] text-[#b5bac1] hover:text-white'}`}>
-                    {isCameraOn ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
-                  </button>
-                </div>
-                <div className="flex flex-col items-center gap-0.5">
-                  <button onClick={onToggleScreenShare} className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${isScreenSharing ? 'bg-[#5865f2] hover:bg-[#4752c4] text-white' : 'bg-[#404249] hover:bg-[#4e5058] text-[#b5bac1] hover:text-white'}`}>
-                    {isScreenSharing ? <MonitorOff className="w-5 h-5" /> : <Monitor className="w-5 h-5" />}
-                  </button>
-                </div>
-              </div>
-
-              <div>
-                <button className="w-10 h-10 rounded-full bg-[#404249] hover:bg-[#4e5058] text-[#b5bac1] hover:text-white flex items-center justify-center transition-colors">
-                  <MoreHorizontal className="w-5 h-5" />
-                </button>
-              </div>
-
-              <button onClick={onDisconnect} className="h-10 px-5 rounded-full bg-[#f23f43] hover:bg-[#da373c] text-white flex items-center gap-2 font-medium transition-colors shadow-lg">
-                <PhoneOff className="w-4 h-4" />
-                <span className="text-sm">End</span>
-              </button>
-            </div>
-          )}
+        <div className="text-center">
+          <p className="text-white font-semibold text-base leading-tight">{user.displayName}</p>
+          <p className="text-white/40 text-xs mt-0.5">
+            {isUserDeafened ? 'Deafened' : isUserMuted ? 'Muted' : showRing ? 'Speaking' : 'Connected'}
+          </p>
         </div>
       </div>
-    );
+    )
   }
 
-  // واجهة قناة الصوت الرئيسية
+  const titleText = callDeclined ? 'Call Ended'
+    : isIncomingCall ? 'Incoming Call'
+    : isObserving ? 'Call in Progress'
+    : isDMCall ? 'Voice Call'
+    : channel.name
+
   return (
-    <div className="flex-1 flex flex-col bg-[#1e1e2e] min-w-0 min-h-0">
+    <div className="flex-1 flex flex-col min-w-0 min-h-0 bg-[#11111b] relative overflow-hidden">
+
+      {/* Ambient background glow */}
+      <div className="absolute inset-0 pointer-events-none overflow-hidden">
+        <div className="absolute -top-32 -left-32 w-96 h-96 bg-[#cba6f7]/6 rounded-full blur-3xl" />
+        <div className="absolute -bottom-32 -right-32 w-96 h-96 bg-[#89b4fa]/6 rounded-full blur-3xl" />
+      </div>
+
       {/* Header */}
-      <div className="h-12 px-4 flex items-center justify-between border-b border-[#11111b] shadow-sm flex-shrink-0 bg-[#181825]">
-        <div className="flex items-center gap-2 min-w-0">
+      <div className="relative z-10 h-12 px-4 flex items-center justify-between border-b border-white/5 bg-[#181825]/80 backdrop-blur-sm flex-shrink-0">
+        <div className="flex items-center gap-2.5 px-2 py-1.5 rounded cursor-pointer group relative">
           {onOpenMobileMenu && (
-            <button onClick={onOpenMobileMenu} className="md:hidden text-[#bac2de] hover:text-[#cdd6f4] mr-2 flex-shrink-0">
-              <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/>
+            <button onClick={onOpenMobileMenu} className="md:hidden text-white/50 hover:text-white mr-1 flex-shrink-0">
+              <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="4" x2="20" y1="12" y2="12" /><line x1="4" x2="20" y1="6" y2="6" /><line x1="4" x2="20" y1="18" y2="18" />
               </svg>
             </button>
           )}
-          <Volume2 className="w-5 h-5 text-[#a6adc8] flex-shrink-0" />
-          <span className="font-semibold text-[#cdd6f4] truncate">{channel.name}</span>
-          <div className="w-px h-5 bg-[#45475a] mx-1 hidden sm:block" />
-          <span className="text-sm text-[#6c7086] truncate hidden sm:block">{connectedUsers.length} {t('general.connected')}</span>
+          {/* Live indicator */}
+          {!isIncomingCall && !callDeclined && (
+            <span className="flex items-center gap-1.5 flex-shrink-0">
+              <span className="w-2 h-2 rounded-full bg-[#a6e3a1] animate-pulse" />
+              <span className="text-[#a6e3a1] text-xs font-bold uppercase tracking-widest">Live</span>
+            </span>
+          )}
+          <div className="w-px h-4 bg-white/10 hidden sm:block flex-shrink-0" />
+          <span className="text-white font-semibold truncate">{titleText}</span>
+          {!isIncomingCall && !callDeclined && (
+            <span className="text-white/30 text-sm hidden sm:block flex-shrink-0">
+              · {connectedUsers.length} {connectedUsers.length === 1 ? 'person' : 'people'}
+            </span>
+          )}
         </div>
-        <div className="flex items-center gap-1">
-          <button onClick={() => setIsMinimized(!isMinimized)} className={`p-2 rounded transition-colors ${isMinimized ? 'bg-[#313244] text-[#cdd6f4]' : 'text-[#bac2de] hover:text-[#cdd6f4] hover:bg-[#313244]'}`}>
-            <ChevronDown className={`w-5 h-5 transition-transform ${isMinimized ? 'rotate-180' : ''}`} />
-          </button>
-          <button onClick={() => setShowSettings(!showSettings)} className={`p-2 rounded transition-colors ${showSettings ? 'bg-[#313244] text-[#cdd6f4]' : 'text-[#bac2de] hover:text-[#cdd6f4] hover:bg-[#313244]'}`}>
-            <SlidersHorizontal className="w-5 h-5" />
-          </button>
-        </div>
+        <button onClick={() => setShowSettings(!showSettings)}
+          className={`p-2 rounded-lg transition-colors ${showSettings ? 'bg-white/15 text-white' : 'text-white/40 hover:text-white hover:bg-white/10'}`}>
+          <SlidersHorizontalIcon className="w-4 h-4" />
+        </button>
       </div>
 
-      {/* منطقة الفيديو/الصوت */}
-      {!isMinimized && (
-      <div className="flex-1 overflow-y-auto custom-scrollbar bg-[#11111b]">
-        <div className="h-full flex flex-col items-center justify-center p-4">
+      {/* Main area */}
+      <div className="relative z-10 flex-1 overflow-y-auto custom-scrollbar">
+        <div className="min-h-full flex flex-col items-center justify-center p-6 md:p-10">
+
+          {/* Video grid */}
           {hasAnyVideo ? (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 w-full h-full">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 w-full">
               {isCameraOn && localCameraStream && (
                 <VideoTile stream={localCameraStream} label={`${currentUser.displayName} (You)`} isMuted />
               )}
               {isScreenSharing && localScreenStream && (
-                <VideoTile stream={localScreenStream} label={t('voice.yourScreen') || 'Your Screen'} isMuted />
+                <VideoTile stream={localScreenStream} label="Your Screen" isMuted />
               )}
-              {isStreaming && localStreamStream && (
-                <VideoTile stream={localStreamStream} label={`${currentUser.displayName} (Streaming)`} isMuted />
-              )}
-              {remoteStreams.map((remoteStream) => {
-                const member = connectedUsers.find(u => u.id === remoteStream.userId);
-                const label = remoteStream.isStreaming 
-                  ? `${member?.displayName || remoteStream.userId} (Live)` 
-                  : member?.displayName || remoteStream.userId;
-                return <VideoTile key={remoteStream.userId} stream={remoteStream.stream} label={label} />;
+              {remoteStreams.filter(s => s.hasVideo).map(rs => {
+                const member = connectedUsers.find(u => u.id === rs.userId)
+                return <VideoTile key={rs.userId} stream={rs.stream} label={member?.displayName || 'User'} />
               })}
-              {enhancedConnectedUsers.filter(user => {
-                if (user.id === currentUser.id && isCameraOn) return false;
-                if (remoteStreams.some(rs => rs.userId === user.id)) return false;
-                return true;
-              }).map(user => (
-                <div key={`avatar-${user.id}`} className="relative bg-[#181825] rounded-lg aspect-video flex flex-col items-center justify-center gap-3">
-                  <UserAvatar user={user} size="xl" className="w-16 h-16 text-2xl" />
-                  <span className="text-[#cdd6f4] font-medium text-sm">{user.displayName}</span>
-                </div>
-              ))}
+              {connectedUsers.filter(user => {
+                if (user.id === currentUser.id && isCameraOn) return false
+                if (remoteStreams.some(rs => rs.userId === user.id && rs.hasVideo)) return false
+                return true
+              }).map(user => <AvatarTile key={`av-${user.id}`} user={user} isGrid />)}
             </div>
           ) : (
-            <div className="flex flex-wrap items-center justify-center gap-8 w-full">
-              {enhancedConnectedUsers.map(user => (
-                <div key={user.id} className="flex flex-col items-center gap-2">
-                  <UserAvatar user={user} size="xl" className="w-24 h-24 text-4xl" />
-                  <span className="text-[#cdd6f4] font-medium text-lg">{user.displayName}</span>
+            <div className="flex flex-wrap items-center justify-center gap-10 md:gap-16 w-full">
+              {connectedUsers.map(user => <AvatarTile key={user.id} user={user} />)}
+
+              {/* Pending (ringing) users */}
+              {isDMCall && pendingUsers.map(user => (
+                <div key={`pending-${user.id}`} className="flex flex-col items-center gap-3">
+                  <div className="relative p-1 rounded-full">
+                    {!callDeclined && (
+                      <>
+                        {[0, 0.6, 1.2].map((delay, i) => (
+                          <span key={i} className="absolute inset-0 rounded-full border-2 border-[#89b4fa]/40 animate-ping"
+                            style={{ animationDelay: `${delay}s`, animationDuration: '2s' }} />
+                        ))}
+                      </>
+                    )}
+                    <div className={`relative w-24 h-24 ${callDeclined ? 'opacity-30 grayscale' : 'opacity-60'}`}>
+                      <UserAvatar user={user} size="xl" className="w-24 h-24 text-4xl rounded-full" context="call" />
+                    </div>
+                    {callDeclined && (
+                      <div className="absolute inset-0 flex items-center justify-center animate-in fade-in zoom-in duration-300">
+                        <div className="w-11 h-11 rounded-full bg-[#f38ba8] flex items-center justify-center shadow-xl shadow-[#f38ba8]/30">
+                          <XIcon className="w-6 h-6 text-white" strokeWidth={2.5} />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  <div className="text-center">
+                    <p className="text-white font-semibold text-base">{user.displayName}</p>
+                    <p className={`text-xs mt-0.5 ${callDeclined ? 'text-[#f38ba8]' : 'text-[#89b4fa]'}`}>
+                      {callDeclined ? 'Declined' : (
+                        <span className="flex items-center justify-center gap-1">
+                          Calling<span className="calling-dots" />
+                        </span>
+                      )}
+                    </p>
+                  </div>
                 </div>
               ))}
             </div>
           )}
+        </div>
 
-          {/* إعدادات الصوت */}
-          {showSettings && (
-            <div className="mx-4 mb-4 bg-[#181825] rounded-xl p-4 w-full mt-4">
-              <h3 className="text-xs font-semibold text-[#a6adc8] uppercase tracking-wide mb-4 flex items-center gap-2">
-                <Settings className="w-4 h-4" />{t('voice.audioSettings')}
-              </h3>
-              <div className="mb-5">
-                <label className="block text-[#bac2de] text-xs font-semibold uppercase mb-2">{t('voice.inputVolumeLabel')}</label>
-                <div className="flex items-center gap-3">
-                  <Mic className="w-4 h-4 text-[#6c7086] flex-shrink-0" />
-                  <input type="range" min="0" max="100" value={inputVolume} onChange={(e) => setInputVolume(Number(e.target.value))}
-                    className="flex-1 h-1.5 bg-[#45475a] rounded-full accent-[#cba6f7]" />
-                  <span className="text-xs text-[#bac2de] w-8 text-right">{inputVolume}%</span>
+        {/* Settings panel */}
+        {showSettings && (
+          <div className="mx-4 mb-6 bg-white/5 backdrop-blur-sm rounded-2xl p-5 border border-white/8 animate-in fade-in slide-in-from-top-2 duration-200">
+            <h3 className="text-white/60 text-xs font-bold uppercase tracking-widest mb-5 flex items-center gap-2">
+              <SettingsIcon className="w-3.5 h-3.5" /> Audio Settings
+            </h3>
+            <div className="space-y-5">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-white/50 text-xs font-semibold uppercase tracking-wide">Input Volume</label>
+                  <span className="text-[#cba6f7] text-xs font-mono">{inputVolume}%</span>
                 </div>
+                <input type="range" min="0" max="100" value={inputVolume} onChange={e => setInputVolume(Number(e.target.value))}
+                  className="w-full h-1.5 bg-white/10 rounded-full appearance-none cursor-pointer accent-[#cba6f7]" />
               </div>
               <div>
-                <label className="block text-[#bac2de] text-xs font-semibold uppercase mb-2">{t('voice.outputVolumeLabel')}</label>
-                <div className="flex items-center gap-3">
-                  <Headphones className="w-4 h-4 text-[#6c7086] flex-shrink-0" />
-                  <input type="range" min="0" max="100" value={outputVolume} onChange={(e) => setOutputVolume(Number(e.target.value))}
-                    className="flex-1 h-1.5 bg-[#45475a] rounded-full accent-[#cba6f7]" />
-                  <span className="text-xs text-[#bac2de] w-8 text-right">{outputVolume}%</span>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-white/50 text-xs font-semibold uppercase tracking-wide">Output Volume</label>
+                  <span className="text-[#cba6f7] text-xs font-mono">{outputVolume}%</span>
+                </div>
+                <input type="range" min="0" max="100" value={outputVolume} onChange={e => setOutputVolume(Number(e.target.value))}
+                  className="w-full h-1.5 bg-white/10 rounded-full appearance-none cursor-pointer accent-[#cba6f7]" />
+              </div>
+              <div className="pt-2 border-t border-white/8">
+                <div className="relative">
+                  <button onClick={() => setShowQualityDropdown(!showQualityDropdown)}
+                    className="w-full flex items-center justify-between px-4 py-2.5 bg-white/8 hover:bg-white/12 rounded-xl text-sm text-white/70 hover:text-white transition-colors">
+                    <div className="flex items-center gap-2">
+                      <MonitorIcon className="w-4 h-4" />
+                      <span>Stream Quality: <span className="text-[#cba6f7] font-medium">{streamQuality}</span></span>
+                    </div>
+                    <ChevronDownIcon className={`w-4 h-4 transition-transform ${showQualityDropdown ? 'rotate-180' : ''}`} />
+                  </button>
+                  {showQualityDropdown && (
+                    <div className="absolute bottom-full left-0 mb-2 w-full bg-[#181825] rounded-xl shadow-2xl border border-white/8 overflow-hidden z-20">
+                      {qualityOptions.map(opt => (
+                        <button key={opt.value} onClick={() => { setStreamQuality(opt.value); setShowQualityDropdown(false) }}
+                          className={`w-full flex items-center justify-between px-4 py-2.5 text-left text-sm transition-colors ${streamQuality === opt.value ? 'bg-[#cba6f7]/15 text-white' : 'text-white/60 hover:bg-white/5 hover:text-white'}`}>
+                          <div>
+                            <span className="font-medium">{opt.label}</span>
+                            <span className="text-white/30 text-xs ml-2">{opt.desc}</span>
+                          </div>
+                          {streamQuality === opt.value && <div className="w-2 h-2 rounded-full bg-[#cba6f7]" />}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
-          )}
-        </div>
+          </div>
+        )}
       </div>
-      )}
 
-      {/* أزرار التحكم */}
-      <div className="bg-[#181825] p-3 md:p-4 flex-shrink-0">
-        <div className="flex items-center justify-center gap-2 md:gap-4 flex-wrap">
-          <button onClick={onToggleMute} className={`w-10 h-10 md:w-12 md:h-12 rounded-full flex items-center justify-center transition-all ${isMuted ? 'bg-[#f38ba8] text-white shadow-lg shadow-[#f38ba8]/20' : 'bg-[#313244] text-[#cdd6f4] hover:bg-[#45475a]'}`}>
-            {isMuted ? <MicOff className="w-4 h-4 md:w-5 md:h-5" /> : <Mic className="w-4 h-4 md:w-5 md:h-5" />}
-          </button>
-          <button onClick={onToggleDeafen} className={`w-10 h-10 md:w-12 md:h-12 rounded-full flex items-center justify-center transition-all relative ${isDeafened ? 'bg-[#f38ba8] text-white shadow-lg shadow-[#f38ba8]/20' : 'bg-[#313244] text-[#cdd6f4] hover:bg-[#45475a]'}`}>
-            <Headphones className="w-4 h-4 md:w-5 md:h-5" />
-            {isDeafened && <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-6 md:w-8 h-0.5 bg-white rotate-45 rounded" />}
-          </button>
-          <button onClick={onToggleCamera} className={`w-10 h-10 md:w-12 md:h-12 rounded-full flex items-center justify-center transition-all ${isCameraOn ? 'bg-[#a6e3a1] text-white' : 'bg-[#313244] text-[#cdd6f4] hover:bg-[#45475a]'}`}>
-            {isCameraOn ? <VideoOff className="w-4 h-4 md:w-5 md:h-5" /> : <Video className="w-4 h-4 md:w-5 md:h-5" />}
-          </button>
-          <button onClick={onToggleScreenShare} className={`w-10 h-10 md:w-12 md:h-12 rounded-full flex items-center justify-center transition-all ${isScreenSharing ? 'bg-[#cba6f7] text-white' : 'bg-[#313244] text-[#cdd6f4] hover:bg-[#45475a]'}`}>
-            {isScreenSharing ? <MonitorOff className="w-4 h-4 md:w-5 md:h-5" /> : <Monitor className="w-4 h-4 md:w-5 md:h-5" />}
-          </button>
-          <button onClick={onToggleStreaming} className={`w-10 h-10 md:w-12 md:h-12 rounded-full flex items-center justify-center transition-all ${isStreaming ? 'bg-[#f9e2af] text-black' : 'bg-[#313244] text-[#cdd6f4] hover:bg-[#45475a]'}`}>
-            {isStreaming ? <X className="w-4 h-4 md:w-5 md:h-5" /> : <Monitor className="w-4 h-4 md:w-5 md:h-5" />}
-          </button>
-          <button onClick={onDisconnect} className="w-10 h-10 md:w-12 md:h-12 rounded-full bg-[#f38ba8] text-white flex items-center justify-center hover:bg-[#eba0ac] transition-all shadow-lg shadow-[#f38ba8]/20">
-            <PhoneOff className="w-4 h-4 md:w-5 md:h-5" />
-          </button>
-        </div>
+      {/* Control bar */}
+      <div className="relative z-10 bg-[#181825]/90 backdrop-blur-md border-t border-white/5 px-4 py-4 flex-shrink-0">
+        {callDeclined ? (
+          <div className="flex items-center justify-center">
+            <span className="text-white/40 text-sm">Disconnecting...</span>
+          </div>
+        ) : isIncomingCall ? (
+          /* Incoming call: Accept / Decline */
+          <div className="flex items-center justify-center gap-6">
+            <div className="flex flex-col items-center gap-1.5">
+              <button onClick={onDeclineCall}
+                className="w-14 h-14 rounded-full bg-[#f38ba8] hover:bg-[#f38ba8]/80 text-white flex items-center justify-center transition-all hover:scale-105 shadow-lg shadow-[#f38ba8]/25">
+                <PhoneOffIcon className="w-6 h-6" />
+              </button>
+              <span className="text-white/40 text-xs">Decline</span>
+            </div>
+            <div className="flex flex-col items-center gap-1.5">
+              <button onClick={onAcceptCall}
+                className="w-14 h-14 rounded-full bg-[#a6e3a1] hover:bg-[#a6e3a1]/80 text-white flex items-center justify-center transition-all hover:scale-105 shadow-lg shadow-[#a6e3a1]/25">
+                <PhoneIcon className="w-6 h-6" />
+              </button>
+              <span className="text-white/40 text-xs">Accept</span>
+            </div>
+          </div>
+        ) : isObserving ? (
+          <div className="flex items-center justify-center">
+            <button onClick={onJoinCall}
+              className="h-11 px-8 rounded-full bg-[#a6e3a1] hover:bg-[#a6e3a1]/80 text-white font-semibold flex items-center gap-2 transition-all hover:scale-105 shadow-lg shadow-[#a6e3a1]/20">
+              <PhoneIcon className="w-5 h-5" /> Join Call
+            </button>
+          </div>
+        ) : (
+          /* Normal call controls */
+          <div className="flex items-center justify-center gap-2 md:gap-3 flex-wrap">
+            {/* Mute */}
+            <div className="flex flex-col items-center gap-1">
+              <CtrlBtn onClick={onToggleMute} active={isMuted} activeColor="bg-[#f38ba8]"
+                icon={isMuted ? MicOffIcon : MicIcon} title={isMuted ? 'Unmute' : 'Mute'} />
+              <span className="text-white/30 text-[10px] hidden sm:block">{isMuted ? 'Unmute' : 'Mute'}</span>
+            </div>
+            {/* Deafen */}
+            <div className="flex flex-col items-center gap-1">
+              <div className={`relative w-12 h-12 rounded-full flex items-center justify-center transition-all duration-200 cursor-pointer
+                ${isDeafened ? 'bg-[#f38ba8] shadow-lg text-white' : 'bg-white/10 hover:bg-white/20 text-white/80 hover:text-white backdrop-blur-sm'}`}
+                onClick={onToggleDeafen}>
+                <HeadphonesIcon className="w-5 h-5" />
+                {isDeafened && <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-0.5 bg-white rotate-45 rounded" />}
+              </div>
+              <span className="text-white/30 text-[10px] hidden sm:block">{isDeafened ? 'Undeafen' : 'Deafen'}</span>
+            </div>
+            {/* Camera */}
+            <div className="flex flex-col items-center gap-1">
+              <CtrlBtn onClick={onToggleCamera} active={isCameraOn} activeColor="bg-[#a6e3a1]"
+                icon={isCameraOn ? VideoOffIcon : VideoIcon} title={isCameraOn ? 'Stop Camera' : 'Camera'} />
+              <span className="text-white/30 text-[10px] hidden sm:block">Camera</span>
+            </div>
+            {/* Screen share */}
+            <div className="flex flex-col items-center gap-1">
+              <CtrlBtn onClick={onToggleScreenShare} active={isScreenSharing} activeColor="bg-[#cba6f7]"
+                icon={isScreenSharing ? MonitorOffIcon : MonitorIcon} title={isScreenSharing ? 'Stop Share' : 'Share Screen'} />
+              <span className="text-white/30 text-[10px] hidden sm:block">Screen</span>
+            </div>
+            {/* Disconnect */}
+            <div className="flex flex-col items-center gap-1 ml-2">
+              <button onClick={onDisconnect}
+                className="w-12 h-12 rounded-full bg-[#f38ba8] hover:bg-[#f38ba8]/80 text-white flex items-center justify-center transition-all hover:scale-105 shadow-lg shadow-[#f38ba8]/20">
+                <PhoneOffIcon className="w-5 h-5" />
+              </button>
+              <span className="text-white/30 text-[10px] hidden sm:block">Leave</span>
+            </div>
+          </div>
+        )}
       </div>
     </div>
-  );
+  )
 }

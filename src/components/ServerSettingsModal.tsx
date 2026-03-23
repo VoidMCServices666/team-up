@@ -1,12 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   Trash2, X, Shield, Users, UserPlus, Search, MoreVertical,
   Plus, Check, ChevronRight, Hash, Volume2, MessageSquare,
-  Mic, Image, Settings2, Copy, RefreshCw,
+  Mic, Image, Settings2, Copy, RefreshCw, GripVertical, UserMinus, Ban,
 } from 'lucide-react';
 import { Server, Member, Channel } from '../App';
 import { UserAvatar } from './UserAvatar';
-import { db, Role, DEFAULT_ROLE_PERMISSIONS } from '../lib/database';
+import { db, syncChannel, Role, DEFAULT_ROLE_PERMISSIONS } from '../lib/database';
 
 interface ServerSettingsModalProps {
   isOpen: boolean;
@@ -34,19 +34,16 @@ export function ServerSettingsModal({
   const [inviteCode, setInviteCode] = useState<string | null>(null);
   const [inviteLoading, setInviteLoading] = useState(false);
   const [inviteCopied, setInviteCopied] = useState(false);
-  const [memberRolesMap, setMemberRolesMap] = useState<Record<string, Role[]>>({});
+
+  // ✅ Drag & drop state for roles
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
+  const dragRoleId = useRef<string | null>(null);
+  // ✅ Save bar for Overview
+  const [hasOverviewChanges, setHasOverviewChanges] = useState(false);
 
   const refreshRoles = async () => {
     const r = await db.getRoles(server.id);
     setRoles(r);
-  };
-
-  const refreshMemberRoles = async () => {
-    const map: Record<string, Role[]> = {};
-    for (const member of server.members) {
-      map[member.id] = await db.getMemberRoles(server.id, member.id);
-    }
-    setMemberRolesMap(map);
   };
 
   useEffect(() => {
@@ -54,10 +51,6 @@ export function ServerSettingsModal({
     setServerIcon(server.icon);
     refreshRoles();
   }, [server, isOpen]);
-
-  useEffect(() => {
-    if (activeTab === 'Members') refreshMemberRoles();
-  }, [activeTab]);
 
   if (!isOpen) return null;
 
@@ -136,6 +129,47 @@ export function ServerSettingsModal({
       ? role.memberIds.filter((id) => id !== memberId)
       : [...role.memberIds, memberId];
     await handleUpdateRole(roleId, { memberIds: newMemberIds });
+  };
+
+  // ✅ Drag & drop role reordering
+  const handleDragStart = (roleId: string) => { dragRoleId.current = roleId; };
+  const handleDragOver = (e: React.DragEvent, roleId: string) => { e.preventDefault(); setDragOverId(roleId); };
+  const handleDrop = async (targetRoleId: string) => {
+    if (!dragRoleId.current || dragRoleId.current === targetRoleId) { setDragOverId(null); return; }
+    const fromIdx = roles.findIndex(r => r.id === dragRoleId.current);
+    const toIdx = roles.findIndex(r => r.id === targetRoleId);
+    if (fromIdx === -1 || toIdx === -1) { setDragOverId(null); return; }
+    const newRoles = [...roles];
+    const [moved] = newRoles.splice(fromIdx, 1);
+    newRoles.splice(toIdx, 0, moved);
+    // Update positions
+    for (let i = 0; i < newRoles.length; i++) {
+      await db.saveRole({ ...newRoles[i], position: newRoles.length - 1 - i });
+    }
+    await refreshRoles();
+    dragRoleId.current = null;
+    setDragOverId(null);
+  };
+
+  // ✅ Kick member from server
+  const handleKickMember = async (memberId: string) => {
+    if (!confirm('Are you sure you want to kick this member?')) return;
+    const { deleteDoc, doc } = await import('firebase/firestore');
+    const { db: firestore } = await import('../lib/firebase');
+    await deleteDoc(doc(firestore, 'server_members', `${server.id}_${memberId}`));
+    syncChannel.postMessage({ type: 'servers_updated' });
+  };
+
+  // ✅ Ban member
+  const handleBanMember = async (memberId: string) => {
+    if (!confirm('Are you sure you want to ban this member? They will not be able to rejoin.')) return;
+    const { setDoc, deleteDoc, doc, serverTimestamp } = await import('firebase/firestore');
+    const { db: firestore } = await import('../lib/firebase');
+    await setDoc(doc(firestore, 'server_bans', `${server.id}_${memberId}`), {
+      serverId: server.id, userId: memberId, bannedAt: serverTimestamp(),
+    });
+    await deleteDoc(doc(firestore, 'server_members', `${server.id}_${memberId}`));
+    syncChannel.postMessage({ type: 'servers_updated' });
   };
 
   const handleIconUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -241,12 +275,7 @@ export function ServerSettingsModal({
                     type="text" value={name} onChange={(e) => setName(e.target.value)}
                     className="w-full bg-[#11111b] border border-[#11111b] rounded p-2.5 text-[#cdd6f4] focus:outline-none focus:border-[#89b4fa] transition-colors mb-6"
                   />
-                  {(name !== server.name || serverIcon !== server.icon) && (
-                    <div className="flex items-center justify-end">
-                      <button onClick={() => { setName(server.name); setServerIcon(server.icon); }} className="text-white text-sm mr-4 hover:underline">Reset</button>
-                      <button onClick={handleSave} className="bg-[#a6e3a1] hover:bg-[#a6e3a1]/80 text-white px-6 py-2 rounded text-sm font-medium transition-colors">Save Changes</button>
-                    </div>
-                  )}
+                  {/* Save bar now at bottom - handled below */}
                 </div>
               </div>
             </div>
@@ -314,11 +343,21 @@ export function ServerSettingsModal({
               ) : (
                 <div className="space-y-1">
                   {roles.map((role) => (
-                    <div key={role.id} onClick={() => { setSelectedRoleId(role.id); setRoleSubTab('display'); }} className="flex items-center justify-between p-3 bg-[#181825] rounded hover:bg-[#313244] cursor-pointer group">
+                    <div key={role.id}
+                      draggable
+                      onDragStart={() => handleDragStart(role.id)}
+                      onDragOver={(e) => handleDragOver(e, role.id)}
+                      onDrop={() => handleDrop(role.id)}
+                      onDragEnd={() => setDragOverId(null)}
+                      onClick={() => { setSelectedRoleId(role.id); setRoleSubTab('display'); }}
+                      className={`flex items-center justify-between p-3 rounded cursor-pointer group transition-colors ${dragOverId === role.id ? 'bg-[#cba6f7]/20 border border-[#cba6f7]/40' : 'bg-[#181825] hover:bg-[#313244]'}`}>
                       <div className="flex items-center gap-3">
+                        {/* ✅ Drag handle */}
+                        <GripVertical size={14} className="text-[#45475a] cursor-grab opacity-0 group-hover:opacity-100 flex-shrink-0" />
                         <div className="w-3 h-3 rounded-full" style={{ backgroundColor: role.color }} />
                         <span className="text-[#cdd6f4] font-medium">{role.name}</span>
                         {role.hoist && <span className="text-[10px] bg-[#45475a] text-[#bac2de] px-1.5 py-0.5 rounded">HOISTED</span>}
+                        {role.permissions.administrator && <span className="text-[10px] bg-[#f9e2af]/20 text-[#f9e2af] px-1.5 py-0.5 rounded">ADMIN</span>}
                       </div>
                       <div className="flex items-center gap-4">
                         <span className="text-[#bac2de] text-sm">{role.memberIds.length} members</span>
@@ -447,7 +486,7 @@ export function ServerSettingsModal({
               </div>
               <div className="space-y-1">
                 {server.members.map((member) => {
-                  const mRoles = memberRolesMap[member.id] ?? [];
+                  const mRoles = roles.filter((r) => r.memberIds.includes(member.id));
                   return (
                     <div key={member.id} className="flex items-center justify-between p-2 hover:bg-[#181825] rounded group">
                       <div className="flex items-center gap-3">
@@ -472,7 +511,20 @@ export function ServerSettingsModal({
                           </div>
                         </div>
                       </div>
-                      <div className="opacity-0 group-hover:opacity-100 flex items-center gap-2">
+                      <div className="opacity-0 group-hover:opacity-100 flex items-center gap-1">
+                        {/* ✅ Kick & Ban - بس لو مش الـ owner */}
+                        {member.id !== server.members[0]?.id && (
+                          <>
+                            <button onClick={() => handleKickMember(member.id)}
+                              className="p-1.5 hover:bg-[#f9e2af]/10 rounded text-[#bac2de] hover:text-[#f9e2af] transition-colors" title="Kick Member">
+                              <UserMinus size={15} />
+                            </button>
+                            <button onClick={() => handleBanMember(member.id)}
+                              className="p-1.5 hover:bg-[#f38ba8]/10 rounded text-[#bac2de] hover:text-[#f38ba8] transition-colors" title="Ban Member">
+                              <Ban size={15} />
+                            </button>
+                          </>
+                        )}
                         <button className="p-1.5 hover:bg-[#11111b] rounded text-[#bac2de] hover:text-[#cdd6f4]" title="More Options">
                           <MoreVertical size={16} />
                         </button>
@@ -495,6 +547,17 @@ export function ServerSettingsModal({
             </div>
           )}
         </div>
+
+        {/* ✅ Discord-style save bar */}
+        {activeTab === 'Overview' && (name !== server.name || serverIcon !== server.icon) && (
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 w-[90%] max-w-[700px] bg-[#11111b] rounded-lg p-3 flex items-center justify-between shadow-2xl animate-in slide-in-from-bottom-2 z-10">
+            <span className="text-[#cdd6f4] font-medium px-2">Careful — you have unsaved changes!</span>
+            <div className="flex items-center gap-3">
+              <button onClick={() => { setName(server.name); setServerIcon(server.icon); }} className="text-white hover:underline text-sm font-medium">Reset</button>
+              <button onClick={handleSave} className="bg-[#a6e3a1] hover:bg-[#a6e3a1]/80 text-white px-6 py-2 rounded text-sm font-medium transition-colors">Save Changes</button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

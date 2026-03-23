@@ -12,16 +12,27 @@ interface MemberListProps {
   onMemberClick: (member: Member, event: React.MouseEvent) => void;
   serverId?: string;
   presenceMap?: Record<string, string>;
+  presenceLoaded?: boolean;
+  roles?: Role[];
 }
 
-export function MemberList({ members, onMemberClick, serverId, presenceMap = {} }: MemberListProps) {
+export function MemberList({ members, onMemberClick, serverId, presenceMap = {}, presenceLoaded = false, roles: rolesProp }: MemberListProps) {
   const { t } = useI18n();
   const [roles, setRoles] = useState<Role[]>([]);
   const [serverProfiles, setServerProfiles] = useState<ServerProfile[]>([]);
   const [freshUsers, setFreshUsers] = useState<Record<string, StoredUser>>({});
+
   useEffect(() => {
+    if (rolesProp) {
+      setRoles(rolesProp);
+      return;
+    }
     if (!serverId) return;
     db.getRoles(serverId).then(setRoles);
+  }, [serverId, rolesProp]);
+
+  useEffect(() => {
+    if (!serverId) return;
     db.getServerProfiles(serverId).then(setServerProfiles);
   }, [serverId]);
 
@@ -34,10 +45,11 @@ export function MemberList({ members, onMemberClick, serverId, presenceMap = {} 
     });
   }, [members]);
 
-  const getActualStatus = (member: Member): Member['status'] =>
-    (presenceMap[member.id] as Member['status'])
-    || freshUsers[member.id]?.status
-    || member.status
+  // ✅ لو presenceLoaded = false → Firestore مؤقتاً / لو true → RTDB فقط
+  const getActualStatus = (member: Member): Member['status'] => {
+    if (!presenceLoaded) return member.status
+    return (presenceMap[member.id] as Member['status']) || 'offline'
+  }
 
   const hoistedRoles = roles.filter((r) => r.hoist).sort((a, b) => b.position - a.position);
   const ownerId = members[0]?.id;
@@ -98,7 +110,7 @@ export function MemberList({ members, onMemberClick, serverId, presenceMap = {} 
           user={{ ...member, status: actualStatus, avatar: freshAvatar }}
           size="sm" showStatus
           serverAvatar={getServerAvatar(member)}
-        />
+         context="message" />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1">
             <span className="font-medium group-hover:brightness-110 truncate" style={{ color: nameColor || '#cdd6f4' }}>

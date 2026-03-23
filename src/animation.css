@@ -1,0 +1,75 @@
+/* ============================================================
+   Team UP - Animation Control System
+   ============================================================ */
+
+/* ── 1. Reduce ALL motion (master toggle) ─────────────────── */
+.reduce-motion *,
+.reduce-motion *::before,
+.reduce-motion *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  transition-delay: 0ms !important;
+}
+
+/* Stop GIFs and animated images when reduce-motion is on */
+.reduce-motion img,
+.reduce-motion video {
+  animation-play-state: paused !important;
+}
+
+/* Stop Tailwind animate-* utilities */
+.reduce-motion [class*="animate-"] {
+  animation: none !important;
+}
+
+/* Stop framer-motion transitions */
+.reduce-motion [style*="transform"],
+.reduce-motion [style*="opacity"] {
+  transition: none !important;
+}
+
+/* ── 2. Individual: Avatar in messages ────────────────────── */
+/* لما avatarInMessages = false → ما فيش hover effect على الـ avatars في الرسايل */
+.no-anim-messages .message-avatar img {
+  transition: none !important;
+  transform: none !important;
+}
+.no-anim-messages .message-avatar:hover img {
+  transform: none !important;
+}
+
+/* ── 3. Individual: Avatars in calls ──────────────────────── */
+/* لما avatarInCalls = false → ما فيش pulse على الـ speaking ring */
+.no-anim-calls [class*="ring"] {
+  animation: none !important;
+}
+.no-anim-calls [class*="animate-pulse"] {
+  animation: none !important;
+}
+
+/* ── 4. Individual: Profile animations ───────────────────── */
+.no-anim-profiles .profile-avatar img {
+  transition: none !important;
+  animation: none !important;
+}
+
+/* ── 5. Individual: UI transitions ───────────────────────── */
+/* لما uiTransitions = false → ما فيش slide/fade transitions */
+.no-anim-ui [class*="animate-in"],
+.no-anim-ui [class*="slide-in"],
+.no-anim-ui [class*="fade-in"],
+.no-anim-ui [class*="zoom-in"],
+.no-anim-ui [class*="duration-"] {
+  animation: none !important;
+  transition: none !important;
+}
+
+/* ── 6. System prefers-reduced-motion ────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

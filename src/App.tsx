@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react'
+import React, { useEffect, useState, useRef, useMemo } from 'react'
 import { ServerSidebar } from './components/ServerSidebar'
 import { DMSidebar } from './components/DMSidebar'
 import { FriendsArea } from './components/FriendsArea'
@@ -16,13 +16,17 @@ import { ServerProfileEditor } from './components/ServerProfileEditor'
 import { VoiceChannelPanel } from './components/VoiceChannelPanel'
 import { CreateGroupDMModal } from './components/CreateGroupDMModal'
 import { UserAvatar } from './components/UserAvatar'
+import { InvitePage } from './components/InvitePage'
+import { GroupDMPanel } from './components/GroupDMPanel'
 import { SettingsIcon, ChevronLeftIcon } from 'lucide-react'
 import { auth, rtdb } from './lib/firebase'
 import { onAuthStateChanged, signOut } from 'firebase/auth'
-import { ref, onValue, set, onDisconnect, serverTimestamp as rtdbServerTimestamp, get } from 'firebase/database'
-import { db, syncChannel, StoredUser, VoiceState } from './lib/database'
-import { voiceManager } from './lib/voiceManager'
-import type { RemoteStream } from './lib/voiceManager'
+import { ref, onValue, set, onDisconnect, get } from 'firebase/database'
+import { db, syncChannel, StoredUser, VoiceState, Role, DEFAULT_ROLE_PERMISSIONS } from './lib/database'
+import { livekitVoiceManager } from './lib/livekitVoiceManager'
+import { applyAnimSettings } from './lib/animationSettings'
+import { getLiveKitToken } from './lib/getLiveKitToken'
+import type { RemoteStream } from './lib/livekitVoiceManager'
 
 export interface Member {
   id: string
@@ -88,7 +92,48 @@ function storedUserToMember(u: StoredUser): Member {
   }
 }
 
+// ── Invite URL detection ──────────────────────────────────────────────────────
+function getInviteCode(): string | null {
+  const path = window.location.pathname
+  const hash = window.location.hash
+  const pathMatch = path.match(/\/invite\/([A-Za-z0-9]+)/)
+  if (pathMatch) return pathMatch[1]
+  const hashMatch = hash.match(/\/invite\/([A-Za-z0-9]+)/)
+  if (hashMatch) return hashMatch[1]
+  return null
+}
+
+// ✅ Wrapper يجيب الـ friends من Firebase ويبعتهم للـ Modal
+function CreateGroupDMModalWithFriends({ isOpen, onClose, currentUser, currentUserId, onCreateGroupDM }: {
+  isOpen: boolean; onClose: () => void; currentUser: Member; currentUserId: string;
+  onCreateGroupDM: (name: string, memberIds: string[]) => void;
+}) {
+  const [friends, setFriends] = React.useState<Member[]>([])
+  React.useEffect(() => {
+    if (!isOpen) return
+    db.getFriends(currentUserId).then(fr => setFriends(fr.map(storedUserToMember)))
+  }, [isOpen, currentUserId])
+  return <CreateGroupDMModal isOpen={isOpen} onClose={onClose} currentUser={currentUser} friends={friends} onCreateGroupDM={onCreateGroupDM} />
+}
+
 export function App() {
+  // ── Invite routing ────────────────────────────────────────────────────────
+  const [inviteCode] = useState<string | null>(getInviteCode)
+
+  // لو في invite code → اعرض InvitePage مباشرة
+  if (inviteCode) {
+    return (
+      <InvitePage
+        code={inviteCode}
+        onJoined={() => {
+          // امسح الـ invite من الـ URL وارجع للـ app
+          window.history.pushState({}, '', '/')
+          window.location.reload()
+        }}
+      />
+    )
+  }
+
   const [isLoggedIn, setIsLoggedIn] = useState(false)
   const [currentUser, setCurrentUser] = useState<StoredUser | null>(null)
   const [authChecked, setAuthChecked] = useState(false)
@@ -100,7 +145,34 @@ export function App() {
   const [mobilePanel, setMobilePanel] = useState<'servers' | 'channels' | 'chat'>('chat')
   const [messages, setMessages] = useState<Record<string, Message[]>>({})
   const selectedDMUserId = dmSelection?.type === 'user' ? dmSelection.id : null
+  const [dmUsersCache, setDmUsersCache] = useState<Record<string, import('./App').Member>>({})
   const selectedGroupDMId = dmSelection?.type === 'group' ? dmSelection.id : null
+  const [groupDMs, setGroupDMs] = useState<GroupDM[]>([])
+  const selectedGroupDM = selectedGroupDMId ? groupDMs.find(g => g.id === selectedGroupDMId) : null
+
+  // ── Load group DMs ───────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!currentUser) return
+    const refresh = async () => {
+      const groups = await db.getGroupDMsForUser(currentUser.id)
+      setGroupDMs(groups)
+    }
+    refresh()
+    const handleSync = (e: MessageEvent) => {
+      if (e.data.type === 'group_dms_updated') refresh()
+    }
+    syncChannel.addEventListener('message', handleSync)
+    return () => syncChannel.removeEventListener('message', handleSync)
+  }, [currentUser?.id])
+
+  // ✅ Fetch dmUser from Firebase whenever selectedDMUserId changes
+  // دايماً بيجيب الـ user حتى لو موجود في الـ cache عشان يتحدث
+  useEffect(() => {
+    if (!selectedDMUserId) return
+    db.getUser(selectedDMUserId).then(user => {
+      if (user) setDmUsersCache(prev => ({ ...prev, [selectedDMUserId]: user as any }))
+    }).catch(() => {})
+  }, [selectedDMUserId])
   const [connectedVoice, setConnectedVoice] = useState<ConnectedVoiceState | null>(null)
   const [isMuted, setIsMuted] = useState(false)
   const [isDeafened, setIsDeafened] = useState(false)
@@ -118,29 +190,80 @@ export function App() {
   const [voiceStates, setVoiceStates] = useState<VoiceState[]>([])
   const [isScreenSharing, setIsScreenSharing] = useState(false)
   const [isCameraOn, setIsCameraOn] = useState(false)
-  const [isStreaming, setIsStreaming] = useState(false)
   const [localCameraStream, setLocalCameraStream] = useState<MediaStream | null>(null)
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null)
-  const [localStreamStream, setLocalStreamStream] = useState<MediaStream | null>(null)
   const [remoteStreams, setRemoteStreams] = useState<RemoteStream[]>([])
   const [mutedUserIds, setMutedUserIds] = useState<Set<string>>(new Set())
   const [showCreateGroupDM, setShowCreateGroupDM] = useState(false)
   const [presenceMap, setPresenceMap] = useState<Record<string, string>>({})
-  // ✅ unread DM counts per contextId
+  const [presenceLoaded, setPresenceLoaded] = useState(false)
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({})
-  // ✅ active voice calls per DM userId
+  const [rolesMap, setRolesMap] = useState<Record<string, Role[]>>({})
   const [dmVoiceStates, setDmVoiceStates] = useState<Record<string, 'calling' | 'in_call'>>({})
+  const [incomingCall, setIncomingCall] = useState<{ callerId: string; channelId: string; callerUser?: Member } | null>(null)
 
   const currentMember: Member | null = currentUser ? storedUserToMember(currentUser) : null
   const presenceIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const lastManualStatusRef = useRef<'online' | 'idle' | 'dnd' | 'offline'>('online')
+
+  // Memoize connected users for voice channels to ensure re-renders when voiceStates change
+  const currentVoiceUsers = useMemo(() => {
+    if (!connectedVoice) return []
+    if (connectedVoice.serverId === 'dm') {
+      return voiceStates.filter(vs => vs.channelId === connectedVoice.channelId).map(vs => servers.flatMap(s => s.members).find(m => m.id === vs.userId)).filter(Boolean) as Member[]
+    } else {
+      const server = servers.find(s => s.id === connectedVoice.serverId)
+      return server ? voiceStates.filter(vs => vs.channelId === connectedVoice.channelId && vs.serverId === connectedVoice.serverId).map(vs => server.members.find(m => m.id === vs.userId)).filter(Boolean) as Member[] : []
+    }
+  }, [voiceStates, connectedVoice, servers])
+
+  const [isOnline, setIsOnline] = useState(navigator.onLine)
 
   const [serverBarPosition, setServerBarPosition] = useState<'left' | 'right'>(() => {
     try { const s = localStorage.getItem('teamup_server_bar_position'); if (s === 'left' || s === 'right') return s } catch {}
     return 'left'
   })
 
+  // ── Server bar position sync ──────────────────────────────────────────────
+  useEffect(() => {
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key === 'teamup_server_bar_position') {
+        const val = e.newValue
+        if (val === 'left' || val === 'right') setServerBarPosition(val)
+      }
+    }
+    window.addEventListener('storage', handleStorage)
+    return () => window.removeEventListener('storage', handleStorage)
+  }, [])
+
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true)
+      console.log('[Network] Back online - listeners will reconnect automatically')
+    }
+    const handleOffline = () => {
+      setIsOnline(false)
+      console.log('[Network] Gone offline - listeners paused')
+    }
+
+    window.addEventListener('online', handleOnline)
+    window.addEventListener('offline', handleOffline)
+
+    return () => {
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('offline', handleOffline)
+    }
+  }, [])
+
   // ── Firebase Auth ─────────────────────────────────────────────────────────
+  // ✅ Apply animation settings on mount + watch for changes
+  useEffect(() => {
+    applyAnimSettings()
+    const handler = () => applyAnimSettings()
+    window.addEventListener('teamup_anim_changed', handler)
+    return () => window.removeEventListener('teamup_anim_changed', handler)
+  }, [])
+
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       if (firebaseUser) {
@@ -165,18 +288,17 @@ export function App() {
     const uid = currentUser.id
     const presenceRef = ref(rtdb, `presence/${uid}`)
 
-    // ✅ لو الـ status مش offline → احفظه كـ lastManualStatus في الـ ref والـ Firestore
     if (currentUser.status !== 'offline') {
       lastManualStatusRef.current = currentUser.status
     }
 
     const getStatus = async (): Promise<'online' | 'idle' | 'dnd'> => {
-      // أولوية: 1) ref (لو في نفس الـ session) 2) Firestore lastManualStatus 3) online
+      // ✅ أولوية: 1) lastManualStatusRef 2) lastManualStatus من Firestore 3) online
       if (lastManualStatusRef.current && lastManualStatusRef.current !== 'offline') {
         return lastManualStatusRef.current as 'online' | 'idle' | 'dnd'
       }
-      // جيب من Firestore
       const freshProfile = await db.getUser(uid)
+      // ✅ بنقرأ lastManualStatus مش status (عشان status ممكن يكون offline)
       const saved = (freshProfile as any)?.lastManualStatus
       if (saved && saved !== 'offline') return saved as 'online' | 'idle' | 'dnd'
       return 'online'
@@ -186,38 +308,78 @@ export function App() {
       const status = await getStatus()
       lastManualStatusRef.current = status
       const now = Date.now()
-      // حدّث الـ RTDB
       await set(presenceRef, { status, lastSeen: now })
-      // جيب الـ profile كامل من Firestore
+      // ✅ جيب الـ profile الحالي وعدّل status بس - مش بنعيد كتابة كل حاجة
       const freshProfile = await db.getUser(uid)
-      const updatedUser = freshProfile ? { ...freshProfile, status } : { ...currentUser, status }
-      await db.saveUser(updatedUser)
-      setCurrentUser(updatedUser)
+      if (freshProfile) {
+        const updatedUser = { ...freshProfile, status }
+        // ✅ حفظ lastManualStatus في Firestore عشان يبقى متاح لما يرجع
+        await db.saveUser({ ...updatedUser, lastManualStatus: status } as any)
+        setCurrentUser(updatedUser)
+      } else {
+        const updatedUser = { ...currentUser, status }
+        await db.saveUser({ ...updatedUser, lastManualStatus: status } as any)
+        setCurrentUser(updatedUser)
+      }
       syncChannel.postMessage({ type: 'users_updated' })
     }
 
-    // ✅ Firebase هيعمل offline تلقائياً لما الـ connection تنقطع
+    // ✅ لما الـ connection تنقطع → امسح الـ voice state تلقائياً
+    const voiceStateRef = ref(rtdb, `voice_states/${uid}`)
+    onDisconnect(voiceStateRef).remove()
+
     onDisconnect(presenceRef)
       .set({ status: 'offline', lastSeen: Date.now() })
-      .then(() => goOnline())
+      .then(async () => {
+        // ✅ لما الـ app يشتغل - cleanup stale voice states + sync presence
+        const cleanupOnStart = async () => {
+          // 1) امسح أي voice state علقان لنفسنا من session قديم
+          await db.removeVoiceState(uid).catch(() => {})
 
-    // ✅ Heartbeat كل 20 ثانية - بيبعت دايماً بغض النظر عن visibility
+          // 2) امسح الـ voice states الـ stale (ناس قافلين وفاضلين في call)
+          const { getDocs, collection, query, where, deleteDoc, doc } = await import('firebase/firestore')
+          const { db: firestore } = await import('./lib/firebase')
+          const snapshot = await get(ref(rtdb, 'presence'))
+          if (snapshot.exists()) {
+            const allPresence = snapshot.val() as Record<string, any>
+            for (const [userId, data] of Object.entries(allPresence)) {
+              if (userId === uid) continue
+              if (data?.status === 'offline') {
+                // امسح voice state بتاعه لو موجود
+                await deleteDoc(doc(firestore, 'voice_states', userId)).catch(() => {})
+                // update presence في Firestore
+                const { setDoc, serverTimestamp } = await import('firebase/firestore')
+                await setDoc(
+                  doc(firestore, 'profiles', userId),
+                  { status: 'offline', updatedAt: serverTimestamp() },
+                  { merge: true }
+                ).catch(() => {})
+              }
+            }
+          }
+        }
+        await cleanupOnStart()
+        await goOnline()
+      })
+
+    // ✅ heartbeat كل 30 ثانية - شغال حتى لو الـ tab مش active
     const heartbeatInterval = setInterval(async () => {
-      const currentStatus = await getStatus() // ✅ await عشان getStatus async
+      const currentStatus = await getStatus()
       await set(presenceRef, { status: currentStatus, lastSeen: Date.now() })
-    }, 20000)
+    }, 30000) // كل 30 ثانية - مع STALE_THRESHOLD = 5 دقايق عندنا 10 محاولات قبل offline
 
-    // ✅ مفيش staleCheckInterval - شيلناه خالص
-    // Firebase onDisconnect بيعمل offline تلقائياً لما الـ connection تنقطع
-    const staleCheckInterval = null
+    // ✅ مفيش staleCheckInterval - Firebase onDisconnect هو اللي بيعمل offline تلقائياً
 
-    // ✅ اسمع على تغييرات الـ RTDB
-    // ✅ شيلنا الـ listener على presenceRef بتاع نفسنا
-    // لأنه كان بيخلي الشخص offline لو goOnline أبطأ من الـ onDisconnect
-    // Firebase onDisconnect هو اللي يعمل offline تلقائياً
-    const unsubPresence = () => {} // no-op
+    const unsubPresence = onValue(presenceRef, async (snapshot) => {
+      const data = snapshot.val()
+      if (!data) return
+      if (data.status === 'offline') {
+        await db.saveUser({ ...currentUser, status: 'offline' })
+        setCurrentUser((prev) => prev ? { ...prev, status: 'offline' } : prev)
+        syncChannel.postMessage({ type: 'users_updated' })
+      }
+    })
 
-    // ✅ لما يرجع يفتح التاب → يرجع للـ status بتاعه
     const handleVisibilityChange = async () => {
       if (document.visibilityState === 'visible') {
         await goOnline()
@@ -229,10 +391,72 @@ export function App() {
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange)
       clearInterval(heartbeatInterval)
-      // staleCheckInterval = null فمش محتاج clearInterval
       unsubPresence()
     }
   }, [currentUser?.id])
+
+  // ── Presence-based call disconnect ────────────────────────────────────────
+  // لو شخص في الـ call بقى offline → نشيله بعد 30 ثانية
+  const disconnectTimersRef = useRef<Record<string, NodeJS.Timeout>>({})
+
+  useEffect(() => {
+    if (!connectedVoice || !currentUser) return
+    if (!presenceLoaded) return // ✅ استنى لحد ما presenceMap يتحمل
+
+    // اجيب كل الـ users الموجودين في نفس الـ call
+    const usersInCall = voiceStates.filter(vs => vs.channelId === connectedVoice.channelId)
+
+    for (const vs of usersInCall) {
+      if (vs.userId === currentUser.id) continue // مش بنراقب نفسنا
+      const status = presenceMap[vs.userId]
+      const isOffline = !status || status === 'offline'
+
+      if (isOffline && !disconnectTimersRef.current[vs.userId]) {
+        // ابدأ countdown 30 ثانية
+        console.log(`[Presence] ${vs.userId} is offline in call, starting 30s disconnect timer`)
+        disconnectTimersRef.current[vs.userId] = setTimeout(async () => {
+          // تحقق تاني إنه لسه offline
+          const currentStatus = presenceMap[vs.userId]
+          if (!currentStatus || currentStatus === 'offline') {
+            console.log(`[Presence] Removing ${vs.userId} from call after 30s offline`)
+            // امسح الـ voice state بتاعه
+            await db.removeVoiceState(vs.userId).catch(() => {})
+            try {
+              const { ref: rtdbRef3, remove: rtdbRemove3 } = await import('firebase/database')
+              await rtdbRemove3(rtdbRef3(rtdb, `voice_states/${vs.userId}`)).catch(() => {})
+            } catch {}
+            // امسح الـ audio element بتاعه
+            document.getElementById(`lk-audio-${vs.userId}`)?.remove()
+          }
+          delete disconnectTimersRef.current[vs.userId]
+        }, 30000)
+      } else if (!isOffline && disconnectTimersRef.current[vs.userId]) {
+        // رجع online → الغي الـ timer
+        console.log(`[Presence] ${vs.userId} is back online, cancelling disconnect timer`)
+        clearTimeout(disconnectTimersRef.current[vs.userId])
+        delete disconnectTimersRef.current[vs.userId]
+      }
+    }
+
+    // لو مفيش call → امسح كل الـ timers
+    return () => {
+      if (!connectedVoice) {
+        Object.values(disconnectTimersRef.current).forEach(clearTimeout)
+        disconnectTimersRef.current = {}
+      }
+    }
+  }, [presenceMap, voiceStates, connectedVoice?.channelId, presenceLoaded])
+
+  // ✅ لو presenceMap بيقول إننا offline بعد ما اتحمل → leave call
+  useEffect(() => {
+    if (!connectedVoice || !currentUser) return
+    if (!presenceLoaded) return // ✅ استنى لحد ما presenceMap يتحمل أول
+    const myStatus = presenceMap[currentUser.id]
+    if (myStatus === 'offline') {
+      console.log('[Presence] Self went offline, leaving call automatically')
+      handleLeaveVoice()
+    }
+  }, [presenceMap, connectedVoice?.channelId, presenceLoaded])
 
   // ── Server bar position sync ──────────────────────────────────────────────
   useEffect(() => {
@@ -253,11 +477,32 @@ export function App() {
     if (!currentUser) return
     const userServers = await db.getServers(currentUser.id)
     setServers(userServers)
+    db.saveCachedServers(userServers) // Cache servers locally
+
+    // Load roles for all servers
+    const newRolesMap: Record<string, Role[]> = {}
+    for (const server of userServers) {
+      const roles = await db.getRoles(server.id)
+      newRolesMap[server.id] = roles
+    }
+    setRolesMap(newRolesMap)
+
     const vs = await db.getVoiceStates()
     setVoiceStates(vs)
   }
 
+  // Load cached data on startup
   useEffect(() => {
+    const cachedServers = db.getCachedServers()
+    if (cachedServers) {
+      setServers(cachedServers)
+      // Load cached roles for cached servers
+      const cachedRolesMap: Record<string, Role[]> = {}
+      cachedServers.forEach(server => {
+        // For now, we'll load roles when needed, but we could cache them too
+      })
+      // setRolesMap(cachedRolesMap) // TODO: implement role caching
+    }
     if (currentUser) refreshData()
   }, [currentUser])
 
@@ -265,26 +510,85 @@ export function App() {
   useEffect(() => {
     if (!currentUser) return
 
-    // ✅ Subscribe واحد على الـ RTDB presence للكل
     const presenceRef = ref(rtdb, 'presence')
     const unsubPresenceMap = onValue(presenceRef, (snapshot) => {
       const data = snapshot.val() || {}
       const map: Record<string, string> = {}
+      const STALE_THRESHOLD = 5 * 60 * 1000 // 5 دقايق - بعدها يعتبر offline
+      const now = Date.now()
       Object.entries(data).forEach(([uid, val]: [string, any]) => {
-        map[uid] = val?.status || 'offline'
+        const status = val?.status || 'offline'
+        const lastSeen = val?.lastSeen || 0
+        // ✅ لو status = online بس lastSeen قديم أكتر من 60 ثانية → offline
+        const isStale = status !== 'offline' && (now - lastSeen) > STALE_THRESHOLD
+        map[uid] = isStale ? 'offline' : status
       })
       setPresenceMap(map)
-      // ✅ sync الـ Firestore مع الـ RTDB بدون delay
-      // بس بعمل ده بشكل async خفيف عشان ميأثرش على الـ UI
-      Object.entries(data).forEach(async ([userId, val]: [string, any]) => {
-        if (userId === currentUser?.id) return // نفسنا بيتعمل في presence effect
-        const rtdbStatus = val?.status || 'offline'
-        // update الـ servers cache بدون Firestore write عشان نقلل الـ latency
-      })
+      setPresenceLoaded(true) // ✅ presenceMap اتحمل
     })
 
     const unsubVoice = db.subscribeToVoiceStates((states) => {
       setVoiceStates(states)
+    })
+
+    // Subscribe to roles for all servers
+    const roleUnsubs: (() => void)[] = []
+    servers.forEach(server => {
+      const unsub = db.subscribeToServerRoles(server.id, (roles) => {
+        setRolesMap(prev => ({ ...prev, [server.id]: roles }))
+      })
+      roleUnsubs.push(unsub)
+    })
+
+    // ✅ Listen for incoming DM calls
+    // ✅ نقرأ من inbox بتاعنا فقط - كل يوزر يقرأ inbox بتاعه بس
+    // ✅ امسح الـ stale calls عند الـ load
+    const cleanStaleInboxCalls = async () => {
+      const { get: rtdbGet, remove: rtdbRemove, ref: rtdbRef2 } = await import('firebase/database')
+      const snap = await rtdbGet(rtdbRef2(rtdb, `dm_calls_inbox/${currentUser.id}`)).catch(() => null)
+      if (!snap?.exists()) return
+      const calls = snap.val() as Record<string, any>
+      const now = Date.now()
+      for (const [key, call] of Object.entries(calls)) {
+        if ((now - (call.startedAt || 0)) > 60000) {
+          await rtdbRemove(rtdbRef2(rtdb, `dm_calls_inbox/${currentUser.id}/${key}`)).catch(() => {})
+        }
+      }
+    }
+    cleanStaleInboxCalls()
+
+    const dmCallsRef = ref(rtdb, `dm_calls_inbox/${currentUser.id}`)
+    const unsubDmCalls = onValue(dmCallsRef, async (snapshot) => {
+      if (!snapshot.exists()) { setIncomingCall(null); return }
+      const calls = snapshot.val() as Record<string, any>
+      // كل الـ calls في inbox بتاعنا هي incoming calls لينا
+      const now = Date.now()
+      const myCall = Object.values(calls).find((c: any) =>
+        c.calleeId === currentUser.id &&
+        c.callerId !== currentUser.id &&
+        // ✅ تجاهل الـ calls القديمة أكتر من 60 ثانية (stale)
+        (now - (c.startedAt || 0)) < 60000
+      ) as any
+      if (myCall) {
+        // ✅ استخدم setIncomingCall مع functional update عشان نتجنب closure issue
+        setIncomingCall(prev => {
+          // لو نفس الـ call ومش محتاجين نحدث
+          if (prev?.channelId === myCall.channelId) return prev
+          return { callerId: myCall.callerId, channelId: myCall.channelId }
+        })
+        // جيب بيانات المتصل بشكل منفصل
+        db.getUser(myCall.callerId).then(caller => {
+          if (!caller) return
+          const callerMember: Member = {
+            id: caller.id, username: caller.username, discriminator: caller.discriminator,
+            displayName: caller.displayName, avatar: caller.avatar, avatarColor: caller.avatarColor,
+            status: caller.status, roles: [], joinedAt: new Date(caller.joinedAt), email: caller.email ?? '',
+          }
+          setIncomingCall(prev => prev ? { ...prev, callerUser: callerMember } : null)
+        })
+      } else {
+        setIncomingCall(null)
+      }
     })
 
     const handleSync = (event: MessageEvent) => {
@@ -297,7 +601,6 @@ export function App() {
         db.getMessages(contextId).then((msgs) => {
           setMessages((prev) => {
             const prevMsgs = prev[contextId] || []
-            // ✅ لو في رسايل جديدة ومش في نفس الـ context → زود الـ unread count
             if (msgs.length > prevMsgs.length) {
               const isCurrentContext =
                 (view === 'server' && selectedChannelId === contextId) ||
@@ -319,12 +622,58 @@ export function App() {
     }
     syncChannel.addEventListener('message', handleSync)
 
+    // ✅ إضافة مراقبة حالة الاتصال
+    const handleNetworkChange = () => {
+      if (navigator.onLine) {
+        console.log('[Realtime] Network back online - listeners will reconnect automatically')
+      } else {
+        console.log('[Realtime] Network offline - listeners paused')
+      }
+    }
+
+    window.addEventListener('online', handleNetworkChange)
+    window.addEventListener('offline', handleNetworkChange)
+
     return () => {
+      window.removeEventListener('online', handleNetworkChange)
+      window.removeEventListener('offline', handleNetworkChange)
       unsubVoice()
       unsubPresenceMap()
+      unsubDmCalls()
       syncChannel.removeEventListener('message', handleSync)
     }
   }, [currentUser])
+
+  // Subscribe to roles for all servers
+  useEffect(() => {
+    if (!currentUser || servers.length === 0) return
+
+    const roleUnsubs: (() => void)[] = []
+    servers.forEach(server => {
+      const unsub = db.subscribeToServerRoles(server.id, (roles) => {
+        setRolesMap(prev => ({ ...prev, [server.id]: roles }))
+      })
+      roleUnsubs.push(unsub)
+    })
+
+    // ✅ مراقبة حالة الاتصال للـ roles
+    const handleNetworkChange = () => {
+      if (navigator.onLine) {
+        console.log('[Roles] Network back online - role listeners will reconnect automatically')
+      } else {
+        console.log('[Roles] Network offline - role listeners paused')
+      }
+    }
+
+    window.addEventListener('online', handleNetworkChange)
+    window.addEventListener('offline', handleNetworkChange)
+
+    return () => {
+      window.removeEventListener('online', handleNetworkChange)
+      window.removeEventListener('offline', handleNetworkChange)
+      roleUnsubs.forEach(unsub => unsub())
+    }
+  }, [currentUser, servers])
 
   // ── Load messages with Firebase realtime ──────────────────────────────────
   useEffect(() => {
@@ -341,21 +690,37 @@ export function App() {
       setMessages((prev) => ({ ...prev, [contextId]: msgs }))
     })
 
-    return () => unsub()
+    // ✅ إضافة منطق إعادة الاتصال عند فقدان الاتصال
+    const handleOnline = () => {
+      console.log('[Messages] Reconnecting listener after network recovery')
+      // الـ listener سيعيد الاتصال تلقائيًا، لكن يمكن إضافة منطق إضافي هنا إذا لزم
+    }
+
+    window.addEventListener('online', handleOnline)
+
+    return () => {
+      window.removeEventListener('online', handleOnline)
+      unsub()
+    }
   }, [selectedServerId, selectedChannelId, dmSelection, view, currentUser])
 
   // ── Voice manager callbacks ───────────────────────────────────────────────
   useEffect(() => {
-    voiceManager.setCallbacks({
-      onRemoteStreamsChange: (streams) => setRemoteStreams(streams),
+    livekitVoiceManager.setCallbacks({
+      onRemoteStreamsChange: (streams) => {
+        console.log('[App] Remote streams updated:', streams.length)
+        setRemoteStreams([...streams]) // ✅ new array reference عشان React يعمل re-render
+      },
       onScreenShareStopped: () => { setIsScreenSharing(false); setLocalScreenStream(null) },
       onCameraStopped: () => { setIsCameraOn(false); setLocalCameraStream(null) },
-      onStreamingChange: (streaming) => { setIsStreaming(streaming); if (!streaming) setLocalStreamStream(null) },
       onSpeakingChange: async (isSpeaking: boolean) => {
         if (currentUser) await db.setSpeakingState(currentUser.id, isSpeaking)
       },
+      onConnectionStateChange: (state) => {
+        console.log('[App] LiveKit connection state:', state);
+      },
     })
-    return () => voiceManager.setCallbacks({})
+    return () => livekitVoiceManager.setCallbacks({})
   }, [currentUser])
 
   // ── Handlers ──────────────────────────────────────────────────────────────
@@ -366,7 +731,6 @@ export function App() {
   }
 
   const handleLogout = async () => {
-    // عند logout → offline
     if (currentUser) {
       await db.saveUser({ ...currentUser, status: 'offline' })
     }
@@ -389,6 +753,37 @@ export function App() {
       members: [currentMember],
     }
     await db.saveServer(newServer, currentUser.id)
+
+    const everyoneRole: Role = {
+      id: crypto.randomUUID(),
+      serverId: newServer.id,
+      name: '@everyone',
+      color: '#94a3b8',
+      position: 0,
+      hoist: false,
+      permissions: { ...DEFAULT_ROLE_PERMISSIONS },
+      memberIds: [currentUser.id],
+    }
+    const ownerRole: Role = {
+      id: crypto.randomUUID(),
+      serverId: newServer.id,
+      name: 'Owner',
+      color: '#f38ba8',
+      position: 1,
+      hoist: true,
+      permissions: {
+        ...DEFAULT_ROLE_PERMISSIONS,
+        administrator: true,
+        manageChannels: true,
+        manageRoles: true,
+        kickMembers: true,
+        banMembers: true,
+      },
+      memberIds: [currentUser.id],
+    }
+    await db.saveRole(everyoneRole)
+    await db.saveRole(ownerRole)
+
     await db.addServerMember(newServer.id, currentUser.id)
     await db.saveCategory(newServer.id, { id: crypto.randomUUID(), name: 'Text Channels', position: 0, channelIds: [newServer.channels[0].id] })
     await db.saveCategory(newServer.id, { id: crypto.randomUUID(), name: 'Voice Channels', position: 1, channelIds: [newServer.channels[1].id] })
@@ -425,7 +820,7 @@ export function App() {
     await refreshData()
   }
 
-  const handleSendMessage = async (content: string, attachments?: { name: string; size: number; url: string; type: string }[], voiceMessage?: { url: string; duration: number }, replyTo?: { messageId: string; content: string; authorName: string; authorAvatar?: string }) => {
+  const handleSendMessage = async (content: string, attachments?: { name: string; size: number; url: string; type: string }[], voiceMessage?: { url: string; duration: number }) => {
     if (!currentUser || !currentMember) return
     let contextId = ''
     if (view === 'server' && selectedChannelId) contextId = selectedChannelId
@@ -433,20 +828,52 @@ export function App() {
     else if (view === 'home' && selectedDMUserId) contextId = db.getDMChannelId(currentUser.id, selectedDMUserId)
     else return
 
-    // ✅ تأكد إن مفيش base64 كبير في الـ attachments قبل الحفظ
-    const safeAttachments = attachments?.map((att) => {
-      if (att.url?.startsWith('data:') && att.url.length > 500 * 1024) {
-        console.error('[handleSendMessage] Large base64 detected - should have been uploaded to Cloudinary first!')
-        return { ...att, url: '' } // منع الحفظ
-      }
+    // ✅ upload الـ attachments الكبيرة لـ Cloudinary بدل base64
+    const safeAttachments = attachments ? await Promise.all(attachments.map(async (att) => {
+      if (!att.url?.startsWith('data:')) return att
+      // لو صغير (< 2MB) → ابعته base64 مباشرة
+      if (att.url.length < 2 * 1024 * 1024) return att
+      // لو كبير → upload لـ Cloudinary
+      try {
+        const formData = new FormData()
+        const res = await fetch(att.url)
+        const blob = await res.blob()
+        formData.append('file', blob, att.name)
+        formData.append('upload_preset', 'teamup_uploads')
+        const uploadRes = await fetch('https://api.cloudinary.com/v1_1/dr6kqblfh/auto/upload', { method: 'POST', body: formData })
+        const data = await uploadRes.json()
+        if (data.secure_url) {
+          console.log('[handleSendMessage] Uploaded to Cloudinary:', att.name)
+          return { ...att, url: data.secure_url }
+        }
+      } catch (e) { console.error('[handleSendMessage] Upload failed:', e) }
       return att
-    })
+    })) : undefined
 
-    const newMessage: Message = { id: crypto.randomUUID(), content, author: currentMember, timestamp: new Date(), attachments: safeAttachments, voiceMessage, ...(replyTo ? { replyTo } : {}) }
-    // ✅ optimistic update بس لو مفيش base64 كبير
-    const hasLargeBase64 = safeAttachments?.some((att) => att.url === '')
-    if (!hasLargeBase64) {
-      setMessages((prev) => ({ ...prev, [contextId]: [...(prev[contextId] || []), newMessage] }))
+    const newMessage: Message = { id: crypto.randomUUID(), content, author: currentMember, timestamp: new Date(), attachments: safeAttachments, voiceMessage }
+    setMessages((prev) => ({ ...prev, [contextId]: [...(prev[contextId] || []), newMessage] }))
+    await db.saveMessage(contextId, newMessage)
+  }
+
+  // ✅ Group DM specific send - بيعرف الـ contextId من البراميتر مش من الـ state
+  const handleSendGroupMessage = async (contextId: string, msgContent: string, attachments?: any[], voiceMessage?: any) => {
+    if (!currentUser || !currentMember) return
+    const safeAttachments = attachments ? await Promise.all(attachments.map(async (att) => {
+      if (!att?.url?.startsWith('data:')) return att
+      if (att.url.length < 2 * 1024 * 1024) return att
+      try {
+        const formData = new FormData()
+        const res = await fetch(att.url); const blob = await res.blob()
+        formData.append('file', blob, att.name); formData.append('upload_preset', 'teamup_uploads')
+        const uploadRes = await fetch('https://api.cloudinary.com/v1_1/dr6kqblfh/auto/upload', { method: 'POST', body: formData })
+        const data = await uploadRes.json()
+        if (data.secure_url) return { ...att, url: data.secure_url }
+      } catch {}
+      return att
+    })) : undefined
+    const newMessage: Message = { id: crypto.randomUUID(), content: msgContent, author: currentMember, timestamp: new Date(), attachments: safeAttachments, voiceMessage }
+    if (!safeAttachments?.some(a => a.url === '')) {
+      setMessages(prev => ({ ...prev, [contextId]: [...(prev[contextId] || []), newMessage] }))
     }
     await db.saveMessage(contextId, newMessage)
   }
@@ -508,15 +935,13 @@ export function App() {
 
   const handleStatusChange = async (status: 'online' | 'idle' | 'dnd' | 'offline') => {
     if (!currentUser) return
-    // ✅ احفظ الـ status - لو offline نحتفظ بالـ status القديم عشان نرجعله
     const manualStatus = status === 'offline' ? (lastManualStatusRef.current || 'online') : status
     lastManualStatusRef.current = manualStatus
     const updated = { ...currentUser, status, ...(status !== 'offline' && { lastManualStatus: status }) }
     setCurrentUser(updated)
     await db.saveUser(updated as any)
-    // ✅ حدّث الـ RTDB بالـ status الجديد فوراً
     const presenceRef = ref(rtdb, `presence/${currentUser.id}`)
-    await set(presenceRef, { status, lastSeen: rtdbServerTimestamp() })
+    await set(presenceRef, { status, lastSeen: Date.now() })
     syncChannel.postMessage({ type: 'users_updated' })
   }
 
@@ -545,80 +970,151 @@ export function App() {
     }
     if (connectedVoice) handleLeaveVoice()
     try {
-      const stream = await voiceManager.join(currentUser.id, serverId, channel.id)
+      // Generate LiveKit token for the voice channel
+      const roomName = `${serverId}-${channel.id}`
+      const token = await getLiveKitToken(currentUser.id, roomName)
+      const stream = await livekitVoiceManager.join(currentUser.id, serverId, channel.id, token)
       mediaStreamRef.current = stream
-      voiceManager.setMuted(isMuted); voiceManager.setDeafened(isDeafened)
+      livekitVoiceManager.setMuted(isMuted); livekitVoiceManager.setDeafened(isDeafened)
       setConnectedVoice({ channelId: channel.id, channelName: channel.name, serverId, serverName, joinedAt: Date.now() })
       setSelectedVoiceChannelId(channel.id)
-      setIsScreenSharing(false); setIsCameraOn(false); setIsStreaming(false); setLocalCameraStream(null); setLocalScreenStream(null); setLocalStreamStream(null)
+      setIsScreenSharing(false); setIsCameraOn(false); setLocalCameraStream(null); setLocalScreenStream(null)
       setRemoteStreams([]); setMutedUserIds(new Set())
       await db.setVoiceState({ userId: currentUser.id, serverId, channelId: channel.id, isMuted, isDeafened, joinedAt: Date.now() })
+      // ✅ onDisconnect → امسح الـ voice state تلقائياً لو الـ connection انقطعت
+      const { remove: rmVS, ref: rtdbRef } = await import('firebase/database')
+      onDisconnect(rtdbRef(rtdb, `voice_states/${currentUser.id}`)).remove()
     } catch (err) { console.error('Failed to join voice channel:', err) }
   }
 
   const handleLeaveVoice = async () => {
     if (!currentUser) return
-    voiceManager.leave()
+    livekitVoiceManager.leave()
     mediaStreamRef.current = null
     setConnectedVoice(null); setSelectedVoiceChannelId(null)
-    setIsScreenSharing(false); setIsCameraOn(false); setIsStreaming(false); setLocalCameraStream(null); setLocalScreenStream(null); setLocalStreamStream(null)
+    setIsScreenSharing(false); setIsCameraOn(false); setLocalCameraStream(null); setLocalScreenStream(null)
     setRemoteStreams([]); setMutedUserIds(new Set())
+    // ✅ امسح من Firestore والـ RTDB عشان مفيش stale calling state
     await db.removeVoiceState(currentUser.id)
+    const { remove } = await import('firebase/database')
+    const { ref: rtdbRef } = await import('firebase/database')
+    await remove(rtdbRef(rtdb, `voice_states/${currentUser.id}`)).catch(() => {})
+    // ✅ امسح الـ dm_call notification لو موجود
+    if (connectedVoice?.serverId === 'dm') {
+      // امسح من inbox بتاع كل الأطراف
+    const chId = connectedVoice.channelId
+    // استخرج الـ userIds من الـ channelId
+    const parts = chId.replace('dm-', '').split('-')
+    const otherUserId = parts.find((p: string) => p !== currentUser.id) || ''
+    if (otherUserId) await remove(rtdbRef(rtdb, `dm_calls_inbox/${otherUserId}/${chId}`)).catch(() => {})
+    await remove(rtdbRef(rtdb, `dm_calls_inbox/${currentUser.id}/${chId}`)).catch(() => {})
+    }
   }
 
   const handleToggleMute = async () => {
     const newMuted = !isMuted
-    setIsMuted(newMuted); voiceManager.setMuted(newMuted)
+    setIsMuted(newMuted); livekitVoiceManager.setMuted(newMuted)
     if (connectedVoice && currentUser) await db.setVoiceState({ userId: currentUser.id, serverId: connectedVoice.serverId, channelId: connectedVoice.channelId, isMuted: newMuted, isDeafened, joinedAt: Date.now() })
   }
 
   const handleToggleDeafen = async () => {
     const newDeafened = !isDeafened
-    setIsDeafened(newDeafened); voiceManager.setDeafened(newDeafened)
-    if (newDeafened && !isMuted) { setIsMuted(true); voiceManager.setMuted(true) }
-    else if (!newDeafened && isMuted && isDeafened) { setIsMuted(false); voiceManager.setMuted(false) }
+    setIsDeafened(newDeafened); livekitVoiceManager.setDeafened(newDeafened)
+    if (newDeafened && !isMuted) { setIsMuted(true); livekitVoiceManager.setMuted(true) }
+    else if (!newDeafened) { setIsMuted(false); livekitVoiceManager.setMuted(false) }
     if (connectedVoice && currentUser) await db.setVoiceState({ userId: currentUser.id, serverId: connectedVoice.serverId, channelId: connectedVoice.channelId, isMuted: isMuted || newDeafened, isDeafened: newDeafened, joinedAt: Date.now() })
   }
 
   const handleToggleScreenShare = async () => {
-    if (isScreenSharing) { voiceManager.stopScreenShare(); setIsScreenSharing(false); setLocalScreenStream(null) }
-    else { const s = await voiceManager.startScreenShare(); if (s) { setIsScreenSharing(true); setLocalScreenStream(s) } }
+    if (isScreenSharing) { livekitVoiceManager.stopScreenShare(); setIsScreenSharing(false); setLocalScreenStream(null) }
+    else { const s = await livekitVoiceManager.startScreenShare(); if (s) { setIsScreenSharing(true); setLocalScreenStream(s) } }
   }
 
   const handleToggleCamera = async () => {
-    if (isCameraOn) { voiceManager.stopCamera(); setIsCameraOn(false); setLocalCameraStream(null) }
-    else { const s = await voiceManager.startCamera(); if (s) { setIsCameraOn(true); setLocalCameraStream(s) } }
+    if (isCameraOn) { livekitVoiceManager.stopCamera(); setIsCameraOn(false); setLocalCameraStream(null) }
+    else { const s = await livekitVoiceManager.startCamera(); if (s) { setIsCameraOn(true); setLocalCameraStream(s) } }
   }
 
-  const handleToggleStreaming = async () => {
-    if (isStreaming) { voiceManager.stopStream(); setIsStreaming(false); setLocalStreamStream(null) }
-    else { const s = await voiceManager.startStream(); if (s) { setIsStreaming(true); setLocalStreamStream(s) } }
-  }
+  const handleMuteUser = (userId: string) => { livekitVoiceManager.mutePeer(userId); setMutedUserIds((prev) => new Set([...prev, userId])) }
+  const handleUnmuteUser = (userId: string) => { livekitVoiceManager.unmutePeer(userId); setMutedUserIds((prev) => { const n = new Set(prev); n.delete(userId); return n }) }
 
-  const handleMuteUser = (userId: string) => { voiceManager.mutePeer(userId); setMutedUserIds((prev) => new Set([...prev, userId])) }
-  const handleUnmuteUser = (userId: string) => { voiceManager.unmutePeer(userId); setMutedUserIds((prev) => { const n = new Set(prev); n.delete(userId); return n }) }
+  // ✅ Group DM voice call
+  const handleStartGroupCall = async (memberIds: string[], withVideo: boolean = false) => {
+    if (!currentUser || !selectedGroupDMId) return
+    const callChannelId = `group-${selectedGroupDMId}`
+    if (connectedVoice?.channelId === callChannelId) return
+    if (connectedVoice) handleLeaveVoice()
+    setConnectedVoice({ channelId: callChannelId, channelName: 'Group Call', serverId: 'group', serverName: 'Group DM', joinedAt: Date.now() })
+    setIsScreenSharing(false); setIsCameraOn(false); setLocalCameraStream(null); setLocalScreenStream(null)
+    setRemoteStreams([]); setMutedUserIds(new Set())
+    await db.setVoiceState({ userId: currentUser.id, serverId: 'group', channelId: callChannelId, isMuted, isDeafened, joinedAt: Date.now() })
+    // ✅ ابعت notification لكل الـ members
+    try {
+      const { ref: rRef, set: rSet } = await import('firebase/database')
+      const { rtdb: rDb } = await import('./lib/firebase')
+      for (const memberId of memberIds) {
+        if (memberId === currentUser.id) continue
+        await rSet(rRef(rDb, `dm_calls_inbox/${memberId}/${callChannelId}`), {
+          callerId: currentUser.id, calleeId: memberId,
+          channelId: callChannelId, startedAt: Date.now(), isGroup: true,
+          groupId: selectedGroupDMId,
+        })
+      }
+    } catch {}
+    try {
+      const token = await getLiveKitToken(currentUser.id, callChannelId)
+      const stream = await livekitVoiceManager.join(currentUser.id, 'group', callChannelId, token)
+      mediaStreamRef.current = stream
+      livekitVoiceManager.setMuted(isMuted); livekitVoiceManager.setDeafened(isDeafened)
+      if (withVideo) { const camStream = await livekitVoiceManager.startCamera(); if (camStream) { setIsCameraOn(true); setLocalCameraStream(camStream) } }
+    } catch (err) { console.error('Failed Group call:', err) }
+  }
 
   const handleStartDMCall = async (targetUserId: string, withVideo: boolean = false) => {
     if (!currentUser || !targetUserId) return
-    const dmChannelId = db.getDMChannelId(currentUser.id, targetUserId)
-    const callChannelId = `dm_voice_${dmChannelId}`
+    // Create a simple room name for DM calls: sort user IDs to ensure consistency
+    const roomName = [currentUser.id, targetUserId].sort().join('-')
+    const callChannelId = `dm-${roomName}`
     if (connectedVoice?.channelId === callChannelId) return
     if (connectedVoice) handleLeaveVoice()
     const targetUser = await db.getUser(targetUserId)
     setConnectedVoice({ channelId: callChannelId, channelName: targetUser?.displayName || 'User', serverId: 'dm', serverName: 'Direct Message', joinedAt: Date.now() })
-    setIsScreenSharing(false); setIsCameraOn(false); setIsStreaming(false); setLocalCameraStream(null); setLocalScreenStream(null); setLocalStreamStream(null)
+    // ✅ روح للـ DM تلقائياً عشان يظهر الـ call panel
+    setView('home')
+    setSelectedServerId(null)
+    setSelectedVoiceChannelId(null)
+    setDmSelection({ type: 'user', id: targetUserId })
+    setMobilePanel('chat')
+    setIsScreenSharing(false); setIsCameraOn(false); setLocalCameraStream(null); setLocalScreenStream(null)
     setRemoteStreams([]); setMutedUserIds(new Set())
     await db.setVoiceState({ userId: currentUser.id, serverId: 'dm', channelId: callChannelId, isMuted, isDeafened, joinedAt: Date.now() })
+    // ✅ اكتب الـ call notification في RTDB عشان الطرف التاني يشوفه فوراً
     try {
-      const stream = await voiceManager.join(currentUser.id, 'dm', callChannelId)
+      const { ref: rRef, set: rSet } = await import('firebase/database')
+      const { rtdb: rDb } = await import('./lib/firebase')
+      // ✅ نكتب في inbox بتاع الـ callee مباشرة
+      await rSet(rRef(rDb, `dm_calls_inbox/${targetUserId}/${callChannelId}`), {
+        callerId: currentUser.id,
+        calleeId: targetUserId,
+        channelId: callChannelId,
+        startedAt: Date.now(),
+      })
+    } catch {}
+    // ✅ onDisconnect → امسح الـ voice state تلقائياً
+    const { ref: rtdbRefDM } = await import('firebase/database')
+    onDisconnect(rtdbRefDM(rtdb, `voice_states/${currentUser.id}`)).remove()
+    try {
+      // Generate LiveKit token for DM call
+      const token = await getLiveKitToken(currentUser.id, callChannelId)
+      const stream = await livekitVoiceManager.join(currentUser.id, 'dm', callChannelId, token)
       mediaStreamRef.current = stream
-      voiceManager.setMuted(isMuted); voiceManager.setDeafened(isDeafened)
-      if (withVideo) { const camStream = await voiceManager.startCamera(); if (camStream) { setIsCameraOn(true); setLocalCameraStream(camStream) } }
+      livekitVoiceManager.setMuted(isMuted); livekitVoiceManager.setDeafened(isDeafened)
+      if (withVideo) { const camStream = await livekitVoiceManager.startCamera(); if (camStream) { setIsCameraOn(true); setLocalCameraStream(camStream) } }
     } catch (err) { console.error('Failed DM call:', err) }
   }
 
   const handleProfileClick = (member: Member, e: React.MouseEvent) => {
-    // ✅ استخدم موقع الماوس الفعلي بدل الـ element position
+    // ✅ استخدم mouse position مباشرة عشان يطلع جنب الماوس
     setActiveProfile({ member, position: { x: e.clientX, y: e.clientY } })
   }
 
@@ -637,11 +1133,6 @@ export function App() {
   if (view === 'server' && selectedChannelId) currentMessages = messages[selectedChannelId] || []
   else if (view === 'home' && selectedGroupDMId && currentUser) currentMessages = messages[db.getGroupDMChannelId(selectedGroupDMId)] || []
   else if (view === 'home' && dmSelection && currentUser) currentMessages = messages[db.getDMChannelId(currentUser.id, dmSelection.id)] || []
-
-  const currentVoiceUsers = showVoicePanel && selectedVoiceChannel
-    ? voiceStates.filter((vs) => vs.channelId === selectedVoiceChannel.id && vs.serverId === selectedServer?.id)
-        .map((vs) => selectedServer?.members.find((m) => m.id === vs.userId)).filter(Boolean) as Member[]
-    : []
 
   if (!authChecked) {
     return (
@@ -679,9 +1170,6 @@ export function App() {
                 <DMSidebar currentUser={currentMember} presenceMap={presenceMap} onOpenSettings={() => setShowSettings(true)}
                   isMuted={isMuted} isDeafened={isDeafened} onToggleMute={handleToggleMute} onToggleDeafen={handleToggleDeafen}
                   connectedVoice={connectedVoice} onDisconnect={handleLeaveVoice}
-                  onToggleScreenShare={handleToggleScreenShare} onToggleCamera={handleToggleCamera}
-                  onToggleStreaming={handleToggleStreaming} isScreenSharing={isScreenSharing}
-                  isCameraOn={isCameraOn} isStreaming={isStreaming}
                   onProfileClick={(e) => handleProfileClick(currentMember, e)} selectedDMUserId={selectedDMUserId}
                   onSelectDM={(userId) => {
                     setDmSelection(userId ? { type: 'user', id: userId } : null)
@@ -703,47 +1191,80 @@ export function App() {
               </div>
               {!selectedDMUserId && !selectedGroupDMId ? (
                 <div className={`${mobilePanel === 'chat' ? 'flex' : 'hidden'} md:flex flex-1 min-w-0 min-h-0`}>
-                  <FriendsArea currentUser={currentMember} presenceMap={presenceMap} onStartDM={(userId) => { setDmSelection({ type: 'user', id: userId }); setMobilePanel('chat') }} onMemberClick={handleProfileClick}
+                  <FriendsArea currentUser={currentMember} presenceMap={presenceMap} presenceLoaded={presenceLoaded} onStartDM={(userId) => { setDmSelection({ type: 'user', id: userId }); setMobilePanel('chat') }} onMemberClick={handleProfileClick}
                     onStartVoiceCall={(userId, withVideo) => { setDmSelection({ type: 'user', id: userId }); handleStartDMCall(userId, withVideo || false); setMobilePanel('chat') }}
                     onOpenMobileMenu={() => setMobilePanel('channels')} />
                 </div>
               ) : selectedDMUserId ? (
                 <div className={`${mobilePanel === 'chat' ? 'flex' : 'hidden'} md:flex flex-1 min-w-0 min-h-0`}>
-                  {/* ✅ دايماً بيظهر الـ chat، لو في call بيظهر الـ call panel فوقيه */}
                   <div className="flex flex-col flex-1 min-w-0 min-h-0">
-                    {/* Call panel - بيظهر فوق الـ chat لما يكون في DM call */}
                     {connectedVoice && connectedVoice.serverId === 'dm' && (
                       <div className="h-[280px] flex-shrink-0 border-b border-[#1e1f22]">
                         <VoiceChannelPanel
                           channel={{ id: connectedVoice.channelId, name: 'Voice Call', type: 'voice' }}
                           serverName="Direct Message" currentUser={currentMember}
-                          connectedUsers={(() => {
-                            const inCall = voiceStates.filter(vs => vs.channelId === connectedVoice.channelId).map(vs => servers.flatMap(s => s.members).find(m => m.id === vs.userId)).filter(Boolean) as Member[]
-                            return inCall.length > 0 ? inCall : [currentMember]
-                          })()}
+                          connectedUsers={currentVoiceUsers.length > 0 ? currentVoiceUsers : [currentMember]}
                           isMuted={isMuted} isDeafened={isDeafened}
                           onToggleMute={handleToggleMute} onToggleDeafen={handleToggleDeafen} onDisconnect={handleLeaveVoice}
                           onToggleScreenShare={handleToggleScreenShare} onToggleCamera={handleToggleCamera}
-                          onToggleStreaming={handleToggleStreaming} isScreenSharing={isScreenSharing}
-                          isCameraOn={isCameraOn} isStreaming={isStreaming}
+                          isScreenSharing={isScreenSharing} isCameraOn={isCameraOn}
                           localCameraStream={localCameraStream} localScreenStream={localScreenStream}
-                          localStreamStream={localStreamStream}
                           remoteStreams={remoteStreams} mutedUserIds={mutedUserIds}
                           isDMCall={true}
-                          pendingUsers={(() => { const u = servers.flatMap(s => s.members).find(m => m.id === selectedDMUserId); return u ? [u] : [] })()}
+                          pendingUsers={(() => {
+                            // ✅ ابحث في كل المصادر عشان تلاقي الـ target user
+                            const u = servers.flatMap(s => s.members).find(m => m.id === selectedDMUserId)
+                              || dmUsersCache[selectedDMUserId!]
+                            // ✅ اعرض pending بس لو الـ target مش في الـ call لسه
+                            const targetInCall = voiceStates.some(vs => vs.userId === selectedDMUserId && vs.channelId === connectedVoice.channelId)
+                            return u && !targetInCall ? [u] : []
+                          })()}
                           onOpenMobileMenu={() => setMobilePanel('channels')} />
                       </div>
                     )}
-                    {/* Chat - دايماً ظاهر */}
                     <ChatArea channel={{ id: db.getDMChannelId(currentUser.id, selectedDMUserId), name: 'DM', type: 'text' }}
                       messages={currentMessages} onSendMessage={handleSendMessage} onEditMessage={handleEditMessage} onDeleteMessage={handleDeleteMessage}
                       currentUser={currentMember} onMemberClick={handleProfileClick} showMemberList={false} onToggleMemberList={() => {}} isDM={true}
                       onStartCall={(withVideo) => handleStartDMCall(selectedDMUserId!, withVideo)} dmUserId={selectedDMUserId}
-                        dmUser={servers.flatMap(s => s.members).find(m => m.id === selectedDMUserId) || undefined}
-                        presenceMap={presenceMap}
-                        onOpenMobileMenu={() => setMobilePanel('channels')} />
+                      dmUser={servers.flatMap(s => s.members).find(m => m.id === selectedDMUserId) || dmUsersCache[selectedDMUserId] || undefined}
+                      presenceMap={presenceMap}
+                      onOpenMobileMenu={() => setMobilePanel('channels')} />
                   </div>
                 </div>
+              ) : selectedGroupDMId ? (
+                <GroupDMPanel
+                  groupDM={selectedGroupDM}
+                  groupDMs={groupDMs}
+                  selectedGroupDMId={selectedGroupDMId}
+                  currentUser={currentMember}
+                  currentUserId={currentUser.id}
+                  presenceMap={presenceMap}
+                  dmUsersCache={dmUsersCache}
+                  servers={servers}
+                  messages={currentMessages}
+                  mobilePanel={mobilePanel}
+                  onSendGroupMessage={handleSendGroupMessage}
+                  onEditMessage={handleEditMessage}
+                  onDeleteMessage={handleDeleteMessage}
+                  onMemberClick={handleProfileClick}
+                  onOpenMobileMenu={() => setMobilePanel('channels')}
+                  onStartGroupCall={handleStartGroupCall}
+                  connectedVoice={connectedVoice}
+                  voiceStates={voiceStates}
+                  isMuted={isMuted} isDeafened={isDeafened}
+                  onToggleMute={handleToggleMute} onToggleDeafen={handleToggleDeafen}
+                  onLeaveVoice={handleLeaveVoice}
+                  onToggleScreenShare={handleToggleScreenShare} onToggleCamera={handleToggleCamera}
+                  isScreenSharing={isScreenSharing} isCameraOn={isCameraOn}
+                  localCameraStream={localCameraStream} localScreenStream={localScreenStream}
+                  remoteStreams={remoteStreams} mutedUserIds={mutedUserIds}
+                  onClose={() => setDmSelection(null)}
+                  onGroupDMsUpdated={async () => {
+                    const groups = await db.getGroupDMsForUser(currentUser.id)
+                    setGroupDMs(groups)
+                    if (!groups.find(g => g.id === selectedGroupDMId)) setDmSelection(null)
+                  }}
+                />
               ) : null}
             </>
           ) : (
@@ -796,7 +1317,7 @@ export function App() {
                 )}
                 {showMemberList && selectedServer && !showVoicePanel && (
                   <div className="hidden lg:flex">
-                    <MemberList members={selectedServer.members} currentUser={currentMember} onMemberClick={handleProfileClick} serverId={selectedServerId || undefined} presenceMap={presenceMap} />
+                    <MemberList members={selectedServer.members} currentUser={currentMember} onMemberClick={handleProfileClick} serverId={selectedServerId || undefined} roles={rolesMap[selectedServerId || ''] ?? []} presenceMap={presenceMap} presenceLoaded={presenceLoaded} />
                   </div>
                 )}
               </div>
@@ -825,10 +1346,71 @@ export function App() {
         </div>
       )}
 
+      {/* ✅ Incoming Call Notification */}
+      {incomingCall && incomingCall.callerUser && incomingCall.channelId !== connectedVoice?.channelId && (
+        <div className="fixed bottom-6 right-6 z-50 animate-in slide-in-from-bottom-4 duration-300">
+          <div className="bg-[#1e1e2e] border border-[#313244] rounded-2xl shadow-2xl shadow-black/50 p-4 w-[320px]">
+            {/* Ringing animation */}
+            <div className="flex items-center gap-3 mb-4">
+              <div className="relative flex-shrink-0">
+                <div className="absolute inset-0 rounded-full bg-[#a6e3a1]/20 animate-ping" />
+                <UserAvatar user={incomingCall.callerUser} size="xl" className="w-14 h-14 relative z-10" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-white font-semibold text-base truncate">
+                  {incomingCall.callerUser.displayName || incomingCall.callerUser.username}
+                </p>
+                <p className="text-[#a6adc8] text-sm flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-[#a6e3a1] animate-pulse inline-block" />
+                  Incoming voice call
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              {/* Decline */}
+              <button
+                onClick={async () => {
+                  // امسح الـ notification
+                  try {
+                    const { ref: rRef, remove: rRemove } = await import('firebase/database')
+                    const { rtdb: rDb } = await import('./lib/firebase')
+                    // مش بنمسح عند الرفض - الـ caller لسه في الـ call
+                  } catch {}
+                  setIncomingCall(null)
+                }}
+                className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-full bg-[#f38ba8] hover:bg-[#f38ba8]/80 text-white font-semibold text-sm transition-all hover:scale-105">
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+                Decline
+              </button>
+              {/* Accept */}
+              <button
+                onClick={() => {
+                  const callerId = incomingCall.callerId
+                  setIncomingCall(null)
+                  setView('home')
+                  setSelectedServerId(null)
+                  setDmSelection({ type: 'user', id: callerId })
+                  setSelectedVoiceChannelId(null)
+                  // ✅ setTimeout عشان الـ state يتحدث قبل ما نبدأ المكالمة
+                  setTimeout(() => handleStartDMCall(callerId, false), 100)
+                }}
+                className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-full bg-[#a6e3a1] hover:bg-[#a6e3a1]/80 text-white font-semibold text-sm transition-all hover:scale-105">
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 5a2 2 0 013.586-1.414L9 6l-1 3 2 2 3-1 2.414 2.414A2 2 0 0119 14v3a2 2 0 01-2 2A16 16 0 013 5z" />
+                </svg>
+                Accept
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <CreateServerModal isOpen={showCreateServer} onClose={() => setShowCreateServer(false)} onCreateServer={handleCreateServer} />
       <CreateChannelModal isOpen={showCreateChannel} onClose={() => setShowCreateChannel(false)} onCreateChannel={handleCreateChannel} />
       <CreateCategoryModal isOpen={showCreateCategory} onClose={() => setShowCreateCategory(false)} onCreateCategory={handleCreateCategory} />
-      <CreateGroupDMModal isOpen={showCreateGroupDM} onClose={() => setShowCreateGroupDM(false)} currentUser={currentMember} friends={[]} onCreateGroupDM={handleCreateGroupDM} />
+      <CreateGroupDMModalWithFriends isOpen={showCreateGroupDM} onClose={() => setShowCreateGroupDM(false)} currentUser={currentMember} currentUserId={currentUser.id} onCreateGroupDM={handleCreateGroupDM} />
 
       {selectedServer && (
         <>
@@ -846,6 +1428,7 @@ export function App() {
           serverId={view === 'server' ? selectedServerId || undefined : undefined}
           currentUserId={currentUser.id}
           presenceMap={presenceMap}
+          rolesMap={rolesMap}
           onOpenDM={(userId) => { setView('home'); setSelectedServerId(null); setDmSelection({ type: 'user', id: userId }); setSelectedVoiceChannelId(null); setActiveProfile(null) }}
           onStartCall={(userId) => { setView('home'); setSelectedServerId(null); setDmSelection({ type: 'user', id: userId }); setSelectedVoiceChannelId(null); setActiveProfile(null); handleStartDMCall(userId, false) }} />
       )}

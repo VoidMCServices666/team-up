@@ -1,27 +1,15 @@
 import React, { useEffect, useState, useRef } from 'react';
 import {
-  X,
-  LogOut,
-  Palette,
-  Camera,
-  Check,
-  Eye,
-  EyeOff,
-  Upload,
-  Circle,
-  Moon,
-  MinusCircle,
-  ChevronDownIcon,
-  AlignLeft,
-  AlignRight,
-  ChevronLeft,
-  Loader2 } from 'lucide-react';
+  X, LogOut, Palette, Camera, Check, Eye, EyeOff, Upload, Circle, Moon,
+  MinusCircle, ChevronDownIcon, AlignLeft, AlignRight, ChevronLeft, Loader2, Zap,
+} from 'lucide-react';
 import { UserAvatar } from './UserAvatar';
 import { StatusPicker } from './StatusPicker';
 import { StatusText } from './StatusText';
 import { db } from '../lib/database';
 import { useI18n } from '../lib/i18n';
 import { processImageFile } from '../lib/cloudinary';
+import { getAnimSetting, setAnimSetting, useAnimSetting, useIsReducedMotion, applyAnimSettings, ANIMATION_KEYS } from '../lib/animationSettings';
 import type { Language, LayoutDirection } from '../lib/i18n';
 interface User {
   id?: string;
@@ -47,18 +35,33 @@ interface SettingsModalProps {
 const AVATAR_COLORS = [
 '#89b4fa','#a6e3a1','#f9e2af','#f38ba8','#f5c2e7',
 '#e67e22','#3498db','#1abc9c','#9b59b6','#e91e63'];
-
 const BANNER_COLORS = [
 '#89b4fa','#a6e3a1','#f9e2af','#f38ba8','#f5c2e7',
 '#cba6f7','#fab387','#94e2d5','#74c7ec','#b4befe',
 '#45475a','#313244','#1e1e2e','#585b70','#181825'];
-
 const STATUS_ICONS: Record<string, { icon: React.ElementType; color: string }> = {
   online: { icon: Circle, color: '#a6e3a1' },
   idle: { icon: Moon, color: '#f9e2af' },
   dnd: { icon: MinusCircle, color: '#f38ba8' },
   offline: { icon: EyeOff, color: '#6c7086' }
 };
+// ✅ Individual animation toggle - uses hook for live updates
+function AnimToggle({ animKey, label, desc }: { animKey: string; label: string; desc: string }) {
+  const isOn = useAnimSetting(animKey as any)
+  return (
+    <div className="flex items-center justify-between p-3 bg-[#181825] rounded-lg border border-[#313244]/60">
+      <div className="flex-1 mr-4">
+        <p className="text-[#cdd6f4] text-sm font-medium">{label}</p>
+        <p className="text-xs text-[#6c7086] mt-0.5">{desc}</p>
+      </div>
+      <button onClick={() => { setAnimSetting(animKey as any, !isOn); window.dispatchEvent(new CustomEvent('teamup_anim_changed')) }}
+        className={`w-11 h-6 rounded-full transition-colors relative flex-shrink-0 ${isOn ? 'bg-[#cba6f7]' : 'bg-[#45475a]'}`}>
+        <div className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-all ${isOn ? 'left-5' : 'left-0.5'}`} />
+      </button>
+    </div>
+  )
+}
+
 export function SettingsModal({
   isOpen, onClose, currentUser, onUpdateUser, onLogout
 }: SettingsModalProps) {
@@ -80,9 +83,10 @@ export function SettingsModal({
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [passwordError, setPasswordError] = useState('');
-  // ✅ Cloudinary upload loading states
   const [avatarUploading, setAvatarUploading] = useState(false);
   const [bannerUploading, setBannerUploading] = useState(false);
+  // ✅ Animation settings - hooks بتعمل re-render تلقائياً عند التغيير
+  const isReducedMotion = useIsReducedMotion();
   const [chatFontSize, setChatFontSize] = useState<number>(() => {
     try { const stored = localStorage.getItem('teamup_font_size'); if (stored) return Math.min(24, Math.max(12, parseInt(stored, 10))); } catch {}
     return 16;
@@ -113,6 +117,8 @@ export function SettingsModal({
       if (storedFont) { const val = Math.min(24, Math.max(12, parseInt(storedFont, 10))); setChatFontSize(val); document.documentElement.style.setProperty('--chat-font-size', `${val}px`); }
       const storedScale = localStorage.getItem('teamup_ui_scale');
       if (storedScale) { const val = Math.min(120, Math.max(80, parseInt(storedScale, 10))); setUiScale(val); document.documentElement.style.fontSize = `${val}%`; }
+      // ✅ Apply all animation settings on mount
+      applyAnimSettings();
     } catch {}
   }, []);
   useEffect(() => {
@@ -131,40 +137,23 @@ export function SettingsModal({
     setPendingUser((prev) => ({ ...prev, [field]: value }));
     setHasChanges(true);
   };
-  // ✅ Avatar upload with Cloudinary
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     if (file.size > 10 * 1024 * 1024) { alert('Image must be less than 10MB'); return; }
     setAvatarUploading(true);
-    try {
-      const url = await processImageFile(file);
-      handleChange('avatar', url);
-    } catch (err) {
-      console.error('Avatar upload failed:', err);
-      alert('Failed to upload image. Please try again.');
-    } finally {
-      setAvatarUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    }
+    try { const url = await processImageFile(file); handleChange('avatar', url); }
+    catch { alert('Failed to upload image. Please try again.'); }
+    finally { setAvatarUploading(false); if (fileInputRef.current) fileInputRef.current.value = ''; }
   };
-  // ✅ Banner upload with Cloudinary
   const handleBannerUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     if (file.size > 10 * 1024 * 1024) { alert('Image must be less than 10MB'); return; }
     setBannerUploading(true);
-    try {
-      const url = await processImageFile(file);
-      handleChange('banner', url);
-      handleChange('bannerColor', undefined);
-    } catch (err) {
-      console.error('Banner upload failed:', err);
-      alert('Failed to upload image. Please try again.');
-    } finally {
-      setBannerUploading(false);
-      if (bannerInputRef.current) bannerInputRef.current.value = '';
-    }
+    try { const url = await processImageFile(file); handleChange('banner', url); handleChange('bannerColor', undefined); }
+    catch { alert('Failed to upload image. Please try again.'); }
+    finally { setBannerUploading(false); if (bannerInputRef.current) bannerInputRef.current.value = ''; }
   };
   const showSuccessToast = () => { setShowToast(true); setTimeout(() => setShowToast(false), 2500); };
   const handleSaveField = (field: keyof User, value: string) => { onUpdateUser({ [field]: value }); setActiveAccordion(null); showSuccessToast(); };
@@ -233,7 +222,7 @@ export function SettingsModal({
               {currentUser.banner ? <div className="h-[100px] bg-cover bg-center" style={{ backgroundImage: `url(${currentUser.banner})` }} /> : <div className="h-[100px]" style={{ backgroundColor: currentUser.bannerColor || currentUser.avatarColor }} />}
               <div className="px-4 pb-4 relative">
                 <div className="absolute -top-[40px] ltr:left-4 rtl:right-4 p-[6px] bg-[#181825] rounded-full">
-                  <UserAvatar user={currentUser as any} size="lg" className="w-[80px] h-[80px] text-3xl" />
+                  <UserAvatar user={currentUser as any} size="lg" className="w-[80px] h-[80px] text-3xl" context="profile" />
                 </div>
                 <div className="flex ltr:justify-end rtl:justify-start pt-4 mb-4">
                   <button onClick={() => setActiveTab('User Profile')} className="bg-[#cba6f7] hover:bg-[#b4befe] text-white px-4 py-1.5 rounded text-sm font-medium transition-colors">{t('settings.editUserProfile')}</button>
@@ -321,82 +310,6 @@ export function SettingsModal({
               </div>
             </div>
           </div>}
-
-          {activeTab === 'User Profile' &&
-          <div className="animate-in slide-in-from-bottom-4 duration-300">
-            <h2 className="text-xl font-bold text-[#cdd6f4] mb-2">{t('settings.customizeProfile')}</h2>
-            <p className="text-[#bac2de] text-sm mb-6">{t('settings.customizeProfileDesc')}</p>
-            <div className="flex flex-col lg:flex-row gap-8">
-              <div className="flex-1 space-y-6">
-                <div>
-                  <label className="block text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.displayName')}</label>
-                  <input type="text" value={pendingUser.username} onChange={(e) => handleChange('username', e.target.value)} className="w-full bg-[#11111b] border border-[#11111b] rounded p-2.5 text-[#cdd6f4] focus:outline-none focus:border-[#cba6f7] transition-colors" />
-                </div>
-                <div>
-                  <label className="block text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.avatar')}</label>
-                  <div className="flex items-center gap-4">
-                    {/* ✅ Avatar upload button with Cloudinary loading */}
-                    <button onClick={() => !avatarUploading && fileInputRef.current?.click()} disabled={avatarUploading}
-                      className="bg-[#cba6f7] hover:bg-[#b4befe] text-white px-4 py-2 rounded text-sm font-medium transition-colors flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed">
-                      {avatarUploading ? <><Loader2 size={16} className="animate-spin" />Uploading...</> : <><Upload size={16} />{t('settings.uploadImage')}</>}
-                    </button>
-                    <button onClick={() => handleChange('avatar', undefined)} className="text-[#bac2de] hover:text-[#cdd6f4] text-sm font-medium">{t('settings.removeAvatar')}</button>
-                    <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
-                  </div>
-                </div>
-                <div>
-                  <label className="block text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.profileBanner')}</label>
-                  <div className="flex items-center gap-4 mb-3">
-                    {/* ✅ Banner upload button with Cloudinary loading */}
-                    <button onClick={() => !bannerUploading && bannerInputRef.current?.click()} disabled={bannerUploading}
-                      className="bg-[#cba6f7] hover:bg-[#b4befe] text-white px-4 py-2 rounded text-sm font-medium transition-colors flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed">
-                      {bannerUploading ? <><Loader2 size={16} className="animate-spin" />Uploading...</> : <><Upload size={16} />{t('settings.uploadBanner')}</>}
-                    </button>
-                    {pendingUser.banner && <button onClick={() => handleChange('banner', undefined)} className="text-[#f38ba8] hover:text-[#f38ba8]/80 text-sm font-medium">{t('settings.remove')}</button>}
-                    <input ref={bannerInputRef} type="file" accept="image/*" onChange={handleBannerUpload} className="hidden" />
-                  </div>
-                  <div className="text-[#bac2de] text-xs mb-2">{t('settings.pickBannerColor')}</div>
-                  <div className="flex flex-wrap gap-2">
-                    {BANNER_COLORS.map((color) => (
-                      <button key={color} onClick={() => { handleChange('bannerColor', color); handleChange('banner', undefined); }}
-                        className="w-8 h-8 rounded cursor-pointer transition-transform hover:scale-110 flex items-center justify-center border border-[#45475a]" style={{ backgroundColor: color }}>
-                        {!pendingUser.banner && pendingUser.bannerColor === color && <Check size={14} className="text-white drop-shadow-md" />}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <div>
-                  <label className="block text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.aboutMe')}</label>
-                  <textarea value={pendingUser.aboutMe || ''} onChange={(e) => handleChange('aboutMe', e.target.value)} maxLength={190} rows={4} className="w-full bg-[#11111b] border border-[#11111b] rounded p-2.5 text-[#cdd6f4] focus:outline-none focus:border-[#cba6f7] transition-colors resize-none" />
-                  <div className="ltr:text-right rtl:text-left text-xs text-[#bac2de] mt-1">{pendingUser.aboutMe?.length || 0}/190</div>
-                </div>
-                <div>
-                  <label className="block text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.avatarColor')}</label>
-                  <div className="grid grid-cols-5 gap-2">
-                    {AVATAR_COLORS.map((color) => (
-                      <button key={color} onClick={() => handleChange('avatarColor', color)} className="w-10 h-10 rounded-full cursor-pointer transition-transform hover:scale-110 flex items-center justify-center" style={{ backgroundColor: color }}>
-                        {pendingUser.avatarColor === color && <Check size={20} className="text-white drop-shadow-md" />}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-              <div className="w-[300px] flex-shrink-0">
-                <div className="text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.preview')}</div>
-                <div className="bg-[#11111b] rounded-lg shadow-lg overflow-hidden">
-                  {pendingUser.banner ? <div className="h-[60px] bg-cover bg-center" style={{ backgroundImage: `url(${pendingUser.banner})` }} /> : <div className="h-[60px]" style={{ backgroundColor: pendingUser.bannerColor || pendingUser.avatarColor }} />}
-                  <div className="px-4 pb-4 relative">
-                    <div className="absolute -top-[36px] ltr:left-4 rtl:right-4 p-[5px] bg-[#11111b] rounded-full"><UserAvatar user={pendingUser as any} size="lg" className="w-[80px] h-[80px] text-3xl" /></div>
-                    <div className="pt-[48px] mb-3"><span className="text-[#cdd6f4] font-bold text-xl">{pendingUser.username}</span><span className="text-[#bac2de] text-lg">#{pendingUser.discriminator}</span></div>
-                    {pendingUser.customStatus && <div className="text-[#bac2de] text-sm mb-2">💬 <StatusText text={pendingUser.customStatus} /></div>}
-                    <div className="h-[1px] bg-[#181825] w-full mb-4" />
-                    <div className="mb-4"><h3 className="text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.aboutMe')}</h3><p className="text-[#cdd6f4] text-sm whitespace-pre-wrap">{pendingUser.aboutMe || t('settings.aboutMeDefault')}</p></div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>}
-
           {activeTab === 'Appearance' &&
           <div className="animate-in slide-in-from-bottom-4 duration-300">
             <h2 className="text-xl font-bold text-[#cdd6f4] mb-5">{t('settings.appearance')}</h2>
@@ -449,6 +362,51 @@ export function SettingsModal({
                 <ChevronDownIcon className="absolute ltr:right-3 rtl:left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-[#6c7086] pointer-events-none" />
               </div>
             </div>
+
+            {/* ✅ Animations & Motion */}
+            <div className="mt-12 mb-8">
+              <div className="flex items-center gap-2 mb-1">
+                <Zap size={16} className="text-[#cba6f7]" />
+                <h3 className="text-[#bac2de] text-xs font-bold uppercase">Animations & Motion</h3>
+              </div>
+              <p className="text-[#6c7086] text-xs mb-4">Control which animations are active to reduce lag</p>
+              {(() => {
+                const isReduced = isReducedMotion
+                return (
+                  <div className="flex items-center justify-between p-4 bg-[#181825] rounded-lg mb-3 border border-[#313244]">
+                    <div>
+                      <p className="text-[#cdd6f4] font-semibold text-sm">Reduce All Motion</p>
+                      <p className="text-xs text-[#6c7086] mt-0.5">Disables all animations across the app</p>
+                    </div>
+                    <button onClick={() => {
+                      setAnimSetting(ANIMATION_KEYS.reducedMotion, !isReduced)
+                      document.documentElement.classList.toggle('reduce-motion', !isReduced)
+                      window.dispatchEvent(new CustomEvent('teamup_anim_changed'))
+                    }} className={`w-11 h-6 rounded-full transition-colors relative flex-shrink-0 ${isReduced ? 'bg-[#cba6f7]' : 'bg-[#45475a]'}`}>
+                      <div className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-all ${isReduced ? 'left-5' : 'left-0.5'}`} />
+                    </button>
+                  </div>
+                )
+              })()}
+              {(() => {
+                const isReduced = isReducedMotion
+                const opts = [
+                  { key: ANIMATION_KEYS.avatarInMessages as string, label: 'Avatar animations in messages', desc: 'Only animate avatars when hovering over a message' },
+                  { key: ANIMATION_KEYS.avatarInCalls as string,    label: 'Speaking ring in calls',         desc: 'Show green ring animation when someone is speaking' },
+                  { key: ANIMATION_KEYS.avatarInProfiles as string, label: 'Profile animations',             desc: 'Animate avatars in profile popups and panels' },
+                  { key: ANIMATION_KEYS.uiTransitions as string,   label: 'UI transitions',                  desc: 'Slide and fade transitions between views' },
+                ]
+                return (
+                  <div className={`space-y-2 transition-opacity ${isReducedMotion ? 'opacity-40 pointer-events-none' : ''}`}>
+                    <AnimToggle animKey={ANIMATION_KEYS.avatarInMessages} label="Avatar animations in messages" desc="Only animate avatars when hovering over a message" />
+                    <AnimToggle animKey={ANIMATION_KEYS.avatarInCalls}    label="Speaking ring in calls"         desc="Show green ring animation when someone is speaking" />
+                    <AnimToggle animKey={ANIMATION_KEYS.avatarInProfiles} label="Profile animations"             desc="Animate avatars in profile popups and panels" />
+                    <AnimToggle animKey={ANIMATION_KEYS.uiTransitions}   label="UI transitions"                  desc="Slide and fade transitions between views" />
+                  </div>
+                )
+              })()}
+            </div>
+
             <div className="mt-12">
               <h3 className="text-[#bac2de] text-xs font-bold uppercase mb-3">Preview</h3>
               <div className="bg-[#181825] rounded-lg overflow-hidden border border-[#313244]">
@@ -463,6 +421,85 @@ export function SettingsModal({
                       </div>
                     </div>
                   ))}
+                </div>
+              </div>
+            </div>
+          </div>}
+
+          {activeTab === 'User Profile' &&
+          <div className="animate-in slide-in-from-bottom-4 duration-300">
+            <h2 className="text-xl font-bold text-[#cdd6f4] mb-2">{t('settings.customizeProfile')}</h2>
+            <p className="text-[#bac2de] text-sm mb-6">{t('settings.customizeProfileDesc')}</p>
+            <div className="flex flex-col lg:flex-row gap-8">
+              <div className="flex-1 space-y-6">
+                <div>
+                  <label className="block text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.displayName')}</label>
+                  <input type="text" value={pendingUser.username}
+                    onChange={(e) => {
+                      const val = e.target.value.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27FF}\u{FE00}-\u{FEFF}]/gu, '')
+                      handleChange('username', val)
+                    }}
+                    className="w-full bg-[#11111b] border border-[#11111b] rounded p-2.5 text-[#cdd6f4] focus:outline-none focus:border-[#cba6f7] transition-colors" />
+                  <p className="text-[#6c7086] text-xs mt-1">Letters, numbers, and basic symbols only</p>
+                </div>
+                <div>
+                  <label className="block text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.avatar')}</label>
+                  <div className="flex items-center gap-4">
+                    <button onClick={() => !avatarUploading && fileInputRef.current?.click()} disabled={avatarUploading}
+                      className="bg-[#cba6f7] hover:bg-[#b4befe] text-white px-4 py-2 rounded text-sm font-medium transition-colors flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed">
+                      {avatarUploading ? <><Loader2 size={16} className="animate-spin" />Uploading...</> : <><Upload size={16} />{t('settings.uploadImage')}</>}
+                    </button>
+                    <button onClick={() => handleChange('avatar', undefined)} className="text-[#bac2de] hover:text-[#cdd6f4] text-sm font-medium">{t('settings.removeAvatar')}</button>
+                    <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.profileBanner')}</label>
+                  <div className="flex items-center gap-4 mb-3">
+                    <button onClick={() => !bannerUploading && bannerInputRef.current?.click()} disabled={bannerUploading}
+                      className="bg-[#cba6f7] hover:bg-[#b4befe] text-white px-4 py-2 rounded text-sm font-medium transition-colors flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed">
+                      {bannerUploading ? <><Loader2 size={16} className="animate-spin" />Uploading...</> : <><Upload size={16} />{t('settings.uploadBanner')}</>}
+                    </button>
+                    {pendingUser.banner && <button onClick={() => handleChange('banner', undefined)} className="text-[#f38ba8] hover:text-[#f38ba8]/80 text-sm font-medium">{t('settings.remove')}</button>}
+                    <input ref={bannerInputRef} type="file" accept="image/*" onChange={handleBannerUpload} className="hidden" />
+                  </div>
+                  <div className="text-[#bac2de] text-xs mb-2">{t('settings.pickBannerColor')}</div>
+                  <div className="flex flex-wrap gap-2">
+                    {BANNER_COLORS.map((color) => (
+                      <button key={color} onClick={() => { handleChange('bannerColor', color); handleChange('banner', undefined); }}
+                        className="w-8 h-8 rounded cursor-pointer transition-transform hover:scale-110 flex items-center justify-center border border-[#45475a]" style={{ backgroundColor: color }}>
+                        {!pendingUser.banner && pendingUser.bannerColor === color && <Check size={14} className="text-white drop-shadow-md" />}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.aboutMe')}</label>
+                  <textarea value={pendingUser.aboutMe || ''} onChange={(e) => handleChange('aboutMe', e.target.value)} maxLength={190} rows={4} className="w-full bg-[#11111b] border border-[#11111b] rounded p-2.5 text-[#cdd6f4] focus:outline-none focus:border-[#cba6f7] transition-colors resize-none" />
+                  <div className="ltr:text-right rtl:text-left text-xs text-[#bac2de] mt-1">{pendingUser.aboutMe?.length || 0}/190</div>
+                </div>
+                <div>
+                  <label className="block text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.avatarColor')}</label>
+                  <div className="grid grid-cols-5 gap-2">
+                    {AVATAR_COLORS.map((color) => (
+                      <button key={color} onClick={() => handleChange('avatarColor', color)} className="w-10 h-10 rounded-full cursor-pointer transition-transform hover:scale-110 flex items-center justify-center" style={{ backgroundColor: color }}>
+                        {pendingUser.avatarColor === color && <Check size={20} className="text-white drop-shadow-md" />}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div className="w-[300px] flex-shrink-0">
+                <div className="text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.preview')}</div>
+                <div className="bg-[#11111b] rounded-lg shadow-lg overflow-hidden">
+                  {pendingUser.banner ? <div className="h-[60px] bg-cover bg-center" style={{ backgroundImage: `url(${pendingUser.banner})` }} /> : <div className="h-[60px]" style={{ backgroundColor: pendingUser.bannerColor || pendingUser.avatarColor }} />}
+                  <div className="px-4 pb-4 relative">
+                    <div className="absolute -top-[36px] ltr:left-4 rtl:right-4 p-[5px] bg-[#11111b] rounded-full"><UserAvatar user={pendingUser as any} size="lg" className="w-[80px] h-[80px] text-3xl" context="profile" /></div>
+                    <div className="pt-[48px] mb-3"><span className="text-[#cdd6f4] font-bold text-xl">{pendingUser.username}</span><span className="text-[#bac2de] text-lg">#{pendingUser.discriminator}</span></div>
+                    {pendingUser.customStatus && <div className="text-[#bac2de] text-sm mb-2">💬 <StatusText text={pendingUser.customStatus} /></div>}
+                    <div className="h-[1px] bg-[#181825] w-full mb-4" />
+                    <div className="mb-4"><h3 className="text-[#bac2de] text-xs font-bold uppercase mb-2">{t('settings.aboutMe')}</h3><p className="text-[#cdd6f4] text-sm whitespace-pre-wrap">{pendingUser.aboutMe || t('settings.aboutMeDefault')}</p></div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -560,7 +597,7 @@ export function SettingsModal({
           </div>}
         </div>
 
-        {hasChanges && activeTab === 'User Profile' &&
+        {hasChanges && (activeTab === 'User Profile' || activeTab === 'My Account') &&
         <div className="absolute bottom-4 left-1/2 transform -translate-x-1/2 w-[90%] max-w-[700px] bg-[#11111b] rounded-lg p-3 flex items-center justify-between shadow-2xl animate-in slide-in-from-bottom-2">
           <div className="text-white font-medium px-2">{t('settings.unsavedChanges')}</div>
           <div className="flex items-center space-x-4 rtl:space-x-reverse">

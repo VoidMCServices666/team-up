@@ -1,168 +1,129 @@
-import React, { useEffect, useState } from 'react';
-import {
-  PhoneOff,
-  Monitor,
-  MonitorOff,
-  Video,
-  VideoOff,
-  Signal,
-  Clock,
-  Users } from
-'lucide-react';
-import { useI18n } from '../lib/i18n';
+import React, { useEffect, useState } from 'react'
+import { PhoneOff, Monitor, MonitorOff, Video, VideoOff, Mic, MicOff, Headphones, Clock, Users } from 'lucide-react'
+import { useI18n } from '../lib/i18n'
+
 interface VoicePanelProps {
-  channelName: string;
-  serverName: string;
-  onDisconnect: () => void;
-  isMuted: boolean;
-  isDeafened: boolean;
-  onToggleMute: () => void;
-  onToggleDeafen: () => void;
-  onToggleScreenShare?: () => void;
-  onToggleCamera?: () => void;
-  onToggleStreaming?: () => void;
-  isScreenSharing?: boolean;
-  isCameraOn?: boolean;
-  isStreaming?: boolean;
-  joinedAt?: number;
-  connectedUserCount?: number;
-  userLimit?: number;
+  channelName: string
+  serverName: string
+  onDisconnect: () => void
+  isMuted: boolean
+  isDeafened: boolean
+  onToggleMute: () => void
+  onToggleDeafen: () => void
+  onToggleScreenShare?: () => void
+  onToggleCamera?: () => void
+  isScreenSharing?: boolean
+  isCameraOn?: boolean
+  joinedAt?: number
+  connectedUserCount?: number
+  userLimit?: number
 }
+
 export function VoicePanel({
-  channelName,
-  serverName,
-  onDisconnect,
-  isMuted,
-  isDeafened,
-  onToggleMute,
-  onToggleDeafen,
-  onToggleScreenShare,
-  onToggleCamera,
-  onToggleStreaming,
-  isScreenSharing = false,
-  isCameraOn = false,
-  isStreaming = false,
-  joinedAt,
-  connectedUserCount = 0,
-  userLimit
+  channelName, serverName, onDisconnect,
+  isMuted, isDeafened, onToggleMute, onToggleDeafen,
+  onToggleScreenShare, onToggleCamera,
+  isScreenSharing = false, isCameraOn = false,
+  joinedAt, connectedUserCount = 0, userLimit,
 }: VoicePanelProps) {
-  const { t } = useI18n();
-  const [elapsed, setElapsed] = useState(0);
+  const { t } = useI18n()
+  const [elapsed, setElapsed] = useState(0)
+
   useEffect(() => {
-    if (!joinedAt) return;
-    const tick = () => {
-      setElapsed(Math.floor((Date.now() - joinedAt) / 1000));
-    };
-    tick();
-    const interval = setInterval(tick, 1000);
-    return () => clearInterval(interval);
-  }, [joinedAt]);
-  const formatElapsed = (totalSeconds: number) => {
-    const hrs = Math.floor(totalSeconds / 3600);
-    const mins = Math.floor(totalSeconds % 3600 / 60);
-    const secs = totalSeconds % 60;
-    const pad = (n: number) => n.toString().padStart(2, '0');
-    if (hrs > 0) return `${pad(hrs)}:${pad(mins)}:${pad(secs)}`;
-    return `${pad(mins)}:${pad(secs)}`;
-  };
+    if (!joinedAt) return
+    const tick = () => setElapsed(Math.floor((Date.now() - joinedAt) / 1000))
+    tick()
+    const interval = setInterval(tick, 1000)
+    return () => clearInterval(interval)
+  }, [joinedAt])
+
+  const formatElapsed = (s: number) => {
+    const h = Math.floor(s / 3600)
+    const m = Math.floor((s % 3600) / 60)
+    const sec = s % 60
+    const p = (n: number) => n.toString().padStart(2, '0')
+    return h > 0 ? `${p(h)}:${p(m)}:${p(sec)}` : `${p(m)}:${p(sec)}`
+  }
+
   return (
-    <div className="bg-[#181825] border-b border-[#11111b]">
-      <div className="px-2 pt-2 pb-1">
-        <div className="flex items-center justify-between mb-0.5">
-          <div className="flex items-center font-bold text-xs">
-            <Signal size={14} className="mr-1" />
-            <span className={isDeafened ? 'text-[#f38ba8]' : 'text-[#a6e3a1]'}>
+    <div className="bg-[#181825] border-b border-[#11111b] overflow-hidden">
+      {/* Green header strip */}
+      <div className="px-3 pt-2.5 pb-1">
+        <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-[#a6e3a1] animate-pulse flex-shrink-0" />
+            <span className={`text-xs font-bold ${isDeafened ? 'text-[#f38ba8]' : 'text-[#a6e3a1]'}`}>
               {isDeafened ? t('voice.deafened') : t('voice.connected')}
             </span>
           </div>
-          <button
-            onClick={onDisconnect}
-            className="text-[#bac2de] hover:text-[#f38ba8] transition-colors"
+          <button onClick={onDisconnect}
+            className="p-1 text-white/30 hover:text-[#f38ba8] rounded transition-colors hover:bg-[#f38ba8]/10"
             title={t('voice.disconnect')}>
-            
-            <PhoneOff size={16} />
+            <PhoneOff size={14} />
           </button>
         </div>
-        <div className="text-[#bac2de] text-xs truncate px-0.5">
-          <span className="font-semibold text-[#cdd6f4]">{channelName}</span> /{' '}
-          {serverName}
-        </div>
 
-        {/* Timer & User Count Row */}
-        <div className="flex items-center justify-between mt-1.5 px-0.5">
-          {joinedAt ?
-          <div className="flex items-center gap-1 text-[10px] text-[#a6adc8] font-mono tabular-nums">
-              <Clock size={10} className="text-[#a6e3a1]" />
-              <span>{formatElapsed(elapsed)}</span>
-            </div> :
+        {/* Channel / server name */}
+        <p className="text-xs text-white/40 truncate leading-tight mb-1.5">
+          <span className="text-white/70 font-medium">{channelName}</span>
+          <span className="mx-1 text-white/20">/</span>
+          <span>{serverName}</span>
+        </p>
 
-          <div />
-          }
-          <div
-            className="flex items-center gap-1 text-[10px] text-[#6c7086]"
-            title={t('voice.connectedUsers')}>
-            
-            <Users size={10} />
-            <span>
-              {connectedUserCount}
-              {userLimit && userLimit > 0 ? `/${userLimit}` : ''}
-            </span>
+        {/* Timer + user count */}
+        <div className="flex items-center justify-between">
+          {joinedAt ? (
+            <div className="flex items-center gap-1 text-[10px] text-white/30 font-mono tabular-nums">
+              <Clock size={9} className="text-[#a6e3a1]" />
+              {formatElapsed(elapsed)}
+            </div>
+          ) : <div />}
+          <div className="flex items-center gap-1 text-[10px] text-white/25">
+            <Users size={9} />
+            <span>{connectedUserCount}{userLimit && userLimit > 0 ? `/${userLimit}` : ''}</span>
           </div>
         </div>
       </div>
 
-      <div className="grid grid-cols-3 gap-1 px-2 pb-2">
-        <button
-          onClick={onToggleCamera}
-          className={`flex items-center justify-center py-1.5 rounded transition-colors ${isCameraOn ? 'bg-[#a6e3a1]/20 text-[#a6e3a1]' : 'hover:bg-[#313244] text-[#bac2de] hover:text-[#cdd6f4]'}`}
-          title={isCameraOn ? t('voice.stopCamera') : t('voice.startCamera')}>
-          
-          {isCameraOn ?
-          <VideoOff size={18} className="mr-1.5" /> :
-
-          <Video size={18} className="mr-1.5" />
-          }
-          <span className="text-xs font-medium">
-            {isCameraOn ? t('voice.stop') : t('voice.video')}
-          </span>
-        </button>
-        <button
-          onClick={onToggleScreenShare}
-          className={`flex items-center justify-center py-1.5 rounded transition-colors ${isScreenSharing ? 'bg-[#cba6f7]/20 text-[#cba6f7]' : 'hover:bg-[#313244] text-[#bac2de] hover:text-[#cdd6f4]'}`}
-          title={
-          isScreenSharing ?
-          t('voice.stopScreenShare') :
-          t('voice.shareScreen')
-          }>
-          
-          {isScreenSharing ?
-          <MonitorOff size={18} className="mr-1.5" /> :
-
-          <Monitor size={18} className="mr-1.5" />
-          }
-          <span className="text-xs font-medium">
-            {isScreenSharing ? t('voice.stop') : t('voice.screen')}
-          </span>
-        </button>
-        <button
-          onClick={onToggleStreaming}
-          className={`flex items-center justify-center py-1.5 rounded transition-colors ${isStreaming ? 'bg-[#f38ba8]/20 text-[#f38ba8]' : 'hover:bg-[#313244] text-[#bac2de] hover:text-[#cdd6f4]'}`}
-          title={
-          isStreaming ?
-          t('voice.stopStreaming') :
-          t('voice.startStreaming')
-          }>
-          
-          {isStreaming ?
-          <X size={18} className="mr-1.5" /> :
-
-          <Monitor size={18} className="mr-1.5" />
-          }
-          <span className="text-xs font-medium">
-            {isStreaming ? t('voice.stop') : t('voice.stream')}
-          </span>
-        </button>
+      {/* Control buttons - 2x2 compact grid */}
+      <div className="grid grid-cols-4 gap-px bg-[#11111b] border-t border-[#11111b]">
+        {[
+          {
+            onClick: onToggleMute,
+            active: isMuted,
+            activeColor: 'text-[#f38ba8] bg-[#f38ba8]/10',
+            Icon: isMuted ? MicOff : Mic,
+            title: isMuted ? t('voice.unmute') : t('voice.mute'),
+          },
+          {
+            onClick: onToggleDeafen,
+            active: isDeafened,
+            activeColor: 'text-[#f38ba8] bg-[#f38ba8]/10',
+            Icon: Headphones,
+            title: isDeafened ? t('voice.undeafen') : t('voice.deafen'),
+          },
+          {
+            onClick: onToggleCamera,
+            active: isCameraOn,
+            activeColor: 'text-[#a6e3a1] bg-[#a6e3a1]/10',
+            Icon: isCameraOn ? VideoOff : Video,
+            title: isCameraOn ? t('voice.stopCamera') : t('voice.startCamera'),
+          },
+          {
+            onClick: onToggleScreenShare,
+            active: isScreenSharing,
+            activeColor: 'text-[#cba6f7] bg-[#cba6f7]/10',
+            Icon: isScreenSharing ? MonitorOff : Monitor,
+            title: isScreenSharing ? t('voice.stopScreenShare') : t('voice.shareScreen'),
+          },
+        ].map(({ onClick, active, activeColor, Icon, title }, i) => (
+          <button key={i} onClick={onClick} title={title}
+            className={`flex items-center justify-center py-2 transition-colors bg-[#181825]
+              ${active ? activeColor : 'text-white/30 hover:text-white/60 hover:bg-white/5'}`}>
+            <Icon size={15} className={active && i === 1 && isDeafened ? 'opacity-50' : ''} />
+          </button>
+        ))}
       </div>
-    </div>);
-
+    </div>
+  )
 }
