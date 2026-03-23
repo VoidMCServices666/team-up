@@ -162,8 +162,9 @@ interface MessageBubbleProps {
   onEdit: (messageId: string, newContent: string) => void;
   onDelete: (messageId: string) => void;
   serverId?: string; onPin?: (messageId: string) => void; onUnpin?: (messageId: string) => void;
-  isPinned?: boolean; canPin?: boolean; currentUserId?: string; contextId?: string;
+  isPinned?: boolean; canPin?: boolean; currentUserId?: string; currentUser?: Member; contextId?: string;
   onReply?: (message: Message) => void;
+  onJumpToMessage?: (messageId: string) => void;
 }
 function formatFileSize(bytes: number) { if (bytes < 1024) return bytes + ' B'; if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'; return (bytes / (1024 * 1024)).toFixed(1) + ' MB'; }
 function getFileIcon(type: string) { if (type.startsWith('image/')) return ImageIcon; if (type.startsWith('audio/')) return FileAudioIcon; if (type.startsWith('video/')) return FileVideoIcon; if (type.includes('pdf') || type.includes('document') || type.includes('text')) return FileTextIcon; return FileIcon; }
@@ -283,7 +284,7 @@ function FileAttachment({ attachment, currentUserId }: { attachment: { name: str
   )
 }
 
-export function MessageBubble({ message, isOwnMessage, onAuthorClick, onEdit, onDelete, serverId, onPin, onUnpin, isPinned, canPin, currentUserId = '', contextId = '', onReply }: MessageBubbleProps) {
+function MessageBubbleComponent({ message, isOwnMessage, onAuthorClick, onEdit, onDelete, serverId, onPin, onUnpin, isPinned, canPin, currentUserId = '', currentUser, contextId = '', onReply, onJumpToMessage }: MessageBubbleProps) {
   const { t } = useI18n()
   const [isEditing, setIsEditing] = useState(false)
   const [editContent, setEditContent] = useState(message.content)
@@ -305,20 +306,53 @@ export function MessageBubble({ message, isOwnMessage, onAuthorClick, onEdit, on
 
   const displayName = serverProfile?.nickname || message.author.displayName
   const serverAvatar = serverProfile?.avatar || liveAvatar
+
+  const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const messageText = message.content.toLowerCase()
+  const isMentioned = (() => {
+    if (!message.content) return false
+    if (/@everyone\b/i.test(message.content) || /@here\b/i.test(message.content)) return true
+    if (!currentUserId || !currentUser) return false
+    const current = [currentUser.username, currentUser.displayName].filter(Boolean).map((t) => escapeRegExp(t))
+    if (current.length === 0) return false
+    const mentionRegex = new RegExp(`@(?:${current.join('|')})\\b`, 'i')
+    return mentionRegex.test(message.content)
+  })()
+
   const formatTime = (date: Date) => new Date(date).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })
 
   const handleReaction = async (emoji: string) => {
-    setShowEmojiPicker(false); if (!contextId) return;
-    const currentUserData = await db.getUser(currentUserId); const currentUserAvatar = currentUserData?.avatar || undefined;
+    if (!contextId || !currentUserId) return
+    setShowEmojiPicker(false)
+
+    const currentUserAvatar = currentUser?.avatar
     setReactions(prev => {
-      const updated = { ...prev };
-      if (!updated[emoji]) updated[emoji] = { emoji, userIds: [], userAvatars: {} };
-      const idx = updated[emoji].userIds.indexOf(currentUserId);
-      if (idx === -1) { updated[emoji] = { ...updated[emoji], userIds: [...updated[emoji].userIds, currentUserId], userAvatars: { ...updated[emoji].userAvatars, ...(currentUserAvatar ? { [currentUserId]: currentUserAvatar } : {}) } }; }
-      else { const newIds = updated[emoji].userIds.filter(id => id !== currentUserId); if (newIds.length === 0) { const n = { ...updated }; delete n[emoji]; return n; } const newAvatars = { ...updated[emoji].userAvatars }; delete newAvatars[currentUserId]; updated[emoji] = { ...updated[emoji], userIds: newIds, userAvatars: newAvatars }; }
-      return updated;
-    });
-    await db.addReaction(contextId, message.id, emoji, currentUserId, currentUserAvatar);
+      const updated = { ...prev }
+      if (!updated[emoji]) updated[emoji] = { emoji, userIds: [], userAvatars: {} }
+      const idx = updated[emoji].userIds.indexOf(currentUserId)
+      if (idx === -1) {
+        const newAvatars = { ...updated[emoji].userAvatars }
+        if (currentUserAvatar) newAvatars[currentUserId] = currentUserAvatar
+        updated[emoji] = { ...updated[emoji], userIds: [...updated[emoji].userIds, currentUserId], userAvatars: newAvatars }
+      } else {
+        const newIds = updated[emoji].userIds.filter(id => id !== currentUserId)
+        if (newIds.length === 0) {
+          const n = { ...updated }
+          delete n[emoji]
+          return n
+        }
+        const newAvatars = { ...updated[emoji].userAvatars }
+        delete newAvatars[currentUserId]
+        updated[emoji] = { ...updated[emoji], userIds: newIds, userAvatars: newAvatars }
+      }
+      return updated
+    })
+
+    try {
+      await db.addReaction(contextId, message.id, emoji, currentUserId, currentUserAvatar)
+    } catch (err) {
+      console.error('Reaction save failed', err)
+    }
   }
 
   const handleCopy = async () => {
@@ -335,13 +369,13 @@ export function MessageBubble({ message, isOwnMessage, onAuthorClick, onEdit, on
   const QUICK_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🔥']
 
   return (
-    <div className="flex gap-4 hover:bg-[#313244] px-2 py-1 rounded group relative">
+    <div className={`flex gap-4 px-2 py-1 rounded group relative transition ${isMentioned && !isOwnMessage ? 'bg-[#2b1a39] border border-[#cba6f7]' : 'hover:bg-[#313244]'}`}>
       <div className="cursor-pointer flex-shrink-0" onClick={(e) => onAuthorClick(message.author, e)}>
         <UserAvatar user={message.author} size="md" serverAvatar={serverAvatar} context="message" />
       </div>
       <div className="flex-1 min-w-0">
         {message.replyTo && (
-          <div className="flex items-center gap-2 mb-1 text-xs text-[#6c7086]">
+          <div onClick={() => onJumpToMessage?.(message.replyTo?.messageId)} className="flex items-center gap-2 mb-1 text-xs text-[#6c7086] cursor-pointer hover:bg-[#292b3d] rounded-lg px-2 py-1" title="Jump to replied message">
             <div className="w-4 h-4 border-l-2 border-t-2 border-[#45475a] rounded-tl ml-2 flex-shrink-0" />
             {message.replyTo.authorAvatar ? <img src={message.replyTo.authorAvatar} className="w-4 h-4 rounded-full object-cover" alt="" /> : <div className="w-4 h-4 rounded-full bg-[#cba6f7] flex-shrink-0" />}
             <span className="text-[#cba6f7] font-medium">{message.replyTo.authorName}</span>
@@ -352,6 +386,7 @@ export function MessageBubble({ message, isOwnMessage, onAuthorClick, onEdit, on
           <span className="font-medium text-[#cdd6f4] hover:underline cursor-pointer" onClick={(e) => onAuthorClick(message.author, e)}>{displayName}</span>
           <span className="text-xs text-[#6c7086]">{formatTime(message.timestamp)}</span>
           {isPinned && <span className="text-[10px] text-[#cba6f7] flex items-center gap-0.5"><PinIcon className="w-3 h-3" />{t('message.pinned')}</span>}
+          {isMentioned && !isOwnMessage && <span className="text-[10px] font-semibold text-[#f38ba8] bg-[#2a1b38] px-2 py-0.5 rounded-full">Mentioned you</span>}
         </div>
         {isEditing ? (
           <div className="mt-1">
@@ -359,7 +394,7 @@ export function MessageBubble({ message, isOwnMessage, onAuthorClick, onEdit, on
             <div className="text-xs text-[#a6adc8] mt-1">{t('message.escapeCancel')} • {t('message.enterSave')}</div>
           </div>
         ) : renderedContent && (
-          <><p className="text-[#cdd6f4] break-words" style={{ fontSize: 'inherit' }}>{renderedContent}</p>{firstUrl && <UrlEmbedCard url={firstUrl} />}</>
+          <><p className="text-[#cdd6f4] whitespace-pre-wrap break-words" style={{ fontSize: 'inherit' }}>{renderedContent}</p>{firstUrl && <UrlEmbedCard url={firstUrl} />}</>
         )}
         {message.voiceMessage && <div className="mt-2"><VoiceMessagePlayer url={message.voiceMessage.url} duration={message.voiceMessage.duration} /></div>}
         {message.attachments && message.attachments.length > 0 && (
@@ -395,3 +430,6 @@ export function MessageBubble({ message, isOwnMessage, onAuthorClick, onEdit, on
     </div>
   )
 }
+
+export const MessageBubble = React.memo(MessageBubbleComponent)
+

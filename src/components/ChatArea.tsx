@@ -21,7 +21,7 @@ import { useI18n } from '../lib/i18n'
 interface ChatAreaProps {
   channel: Channel | null
   messages: Message[]
-  onSendMessage: (content: string, attachments?: { name: string; size: number; url: string; type: string }[], voiceMessage?: { url: string; duration: number }) => void
+  onSendMessage: (content: string, attachments?: { name: string; size: number; url: string; type: string }[], voiceMessage?: { url: string; duration: number }, replyTo?: { messageId: string; content: string; authorName: string; authorAvatar?: string }) => void
   onEditMessage: (messageId: string, newContent: string) => void
   onDeleteMessage: (messageId: string) => void
   currentUser: Member
@@ -37,6 +37,8 @@ interface ChatAreaProps {
   presenceMap?: Record<string, string>
   onOpenMobileMenu?: () => void
   contextId?: string
+  typingUsers?: string[]
+  onTyping?: (isTyping: boolean) => void
   members?: Member[] // Added for mentions
 }
 
@@ -50,9 +52,31 @@ export function ChatArea({
   const [messageInput, setMessageInput] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const messagesContainerRef = useRef<HTMLDivElement>(null)
-  const textInputRef = useRef<HTMLInputElement>(null)
+  const textInputRef = useRef<HTMLTextAreaElement>(null)
   const [attachedFiles, setAttachedFiles] = useState<File[]>([])
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const hasPrefilledDmMention = useRef(false)
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+
+  const adjustTextareaHeight = React.useCallback(() => {
+    const textarea = textInputRef.current
+    if (!textarea) return
+    textarea.style.height = 'auto'
+    const maxHeight = 220
+    textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`
+  }, [])
+
+  useEffect(() => {
+    adjustTextareaHeight()
+  }, [messageInput, adjustTextareaHeight])
+
+  useEffect(() => {
+    if (!isDM || !dmUser || hasPrefilledDmMention.current) return
+    if (!messageInput.trim()) {
+      setMessageInput(`@${dmUser.username} `)
+      hasPrefilledDmMention.current = true
+    }
+  }, [isDM, dmUser, messageInput])
   const [isRecording, setIsRecording] = useState(false)
   const [recordingDuration, setRecordingDuration] = useState(0)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
@@ -66,6 +90,7 @@ export function ChatArea({
   const [pinnedRefresh, setPinnedRefresh] = useState(0)
   const [pendingRequestCount, setPendingRequestCount] = useState(0)
   const [isBlockedState, setIsBlockedState] = useState(false)
+  const [isDragging, setIsDragging] = useState(false)
   const [blockedByMe, setBlockedByMe] = useState(false)
   const [blockedByThem, setBlockedByThem] = useState(false)
   const [privacyBlocked, setPrivacyBlocked] = useState(false)
@@ -75,6 +100,8 @@ export function ChatArea({
   const [showMentionDropdown, setShowMentionDropdown] = useState(false)
   const [mentionQuery, setMentionQuery] = useState('')
   const [mentionStart, setMentionStart] = useState(-1)
+  const [replyToMessage, setReplyToMessage] = useState<Message | null>(null)
+  const messageRefs = useRef<Record<string, HTMLDivElement | null>>({})
 
   useEffect(() => {
     if (!isDM || !dmUserId || !currentUser) {
@@ -131,6 +158,14 @@ export function ChatArea({
   const [showScrollTop, setShowScrollTop] = useState(false)
   const prevMessageCountRef = useRef(messages.length)
 
+  const typingUsernames = React.useMemo(() => {
+    if (!typingUsers || typingUsers.length === 0) return []
+    return typingUsers
+      .map((uid) => members.find((m) => m.id === uid) || (dmUser && dmUser.id === uid ? dmUser : null))
+      .filter(Boolean)
+      .map((m) => (m as Member).displayName || (m as Member).username)
+  }, [typingUsers, members, dmUser])
+
   const handleScroll = () => {
     const el = messagesContainerRef.current
     if (!el) return
@@ -140,6 +175,11 @@ export function ChatArea({
     if (pinned) setUnreadCount(0)
     setShowScrollTop(el.scrollTop > 500)
   }
+
+  const handleReplyMessage = React.useCallback((message: Message) => {
+    setReplyToMessage(message)
+    textInputRef.current?.focus()
+  }, [])
 
   useEffect(() => {
     const newCount = messages.length
@@ -161,7 +201,13 @@ export function ChatArea({
   const scrollToTop = () => { messagesContainerRef.current?.scrollTo({ top: 0, behavior: 'smooth' }) }
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
-  useEffect(() => { return () => { if (recordingIntervalRef.current) clearInterval(recordingIntervalRef.current) } }, [])
+  useEffect(() => {
+    return () => {
+      if (recordingIntervalRef.current) clearInterval(recordingIntervalRef.current)
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current)
+      if (onTyping) onTyping(false)
+    }
+  }, [onTyping])
 
   useEffect(() => {
     const refresh = async () => {
@@ -177,7 +223,19 @@ export function ChatArea({
   }, [currentUser.id])
 
   // ── handleSend: base64 بدل blob URLs ──────────────────────────────────────
-  const handleSend = async () => {
+  const scrollToMessage = React.useCallback((messageId: string) => {
+    const el = messageRefs.current[messageId]
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      el.classList.add('ring-2', 'ring-[#f38ba8]')
+      setTimeout(() => el.classList.remove('ring-2', 'ring-[#f38ba8]'), 1500)
+    }
+  }, [])
+
+  const handleSend = React.useCallback(async () => {
+    if (typingTimeoutRef.current) { clearTimeout(typingTimeoutRef.current); typingTimeoutRef.current = null }
+    if (onTyping) onTyping(false)
+
     if (messageInput.trim() || attachedFiles.length > 0) {
       const attachments = await Promise.all(
         attachedFiles.map((file) => new Promise<{ name: string; size: number; url: string; type: string }>((resolve) => {
@@ -186,12 +244,25 @@ export function ChatArea({
           reader.readAsDataURL(file)
         }))
       )
-      onSendMessage(messageInput.trim(), attachments.length > 0 ? attachments : undefined)
-      setMessageInput(''); setAttachedFiles([])
+      onSendMessage(messageInput.trim(), attachments.length > 0 ? attachments : undefined, undefined, replyToMessage ? {
+        messageId: replyToMessage.id,
+        content: replyToMessage.content,
+        authorName: replyToMessage.author.displayName,
+        authorAvatar: replyToMessage.author.avatar,
+      } : undefined)
+      setMessageInput(''); setAttachedFiles([]); setReplyToMessage(null)
+    }
+  }, [messageInput, attachedFiles, onSendMessage, replyToMessage, onTyping])
+
+  const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter') {
+      if (!e.shiftKey) {
+        e.preventDefault()
+        handleSend()
+      }
+      // Shift+Enter => خط جديد طبيعي (لا تمنع)
     }
   }
-
-  const handleKeyPress = (e: React.KeyboardEvent) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => { const files = Array.from(e.target.files || []); setAttachedFiles((prev) => [...prev, ...files]); if (fileInputRef.current) fileInputRef.current.value = '' }
   const removeAttachedFile = (index: number) => { setAttachedFiles((prev) => prev.filter((_, i) => i !== index)) }
   const formatFileSize = (bytes: number) => { if (bytes < 1024) return bytes + ' B'; if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'; return (bytes / (1024 * 1024)).toFixed(1) + ' MB' }
@@ -238,9 +309,68 @@ export function ChatArea({
   const handleEmojiSelect = (emoji: string) => { setMessageInput((prev) => prev + emoji); setShowEmojiPicker(false); textInputRef.current?.focus() }
   const handleGifSelect = (url: string) => { onSendMessage('', [{ name: 'gif', size: 0, url, type: 'image/gif' }]); setShowGifStickerPicker(false) }
 
-  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handlePaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
+    const items = Array.from(e.clipboardData.items || [])
+    const imageItems = items.filter(item => item.type.startsWith('image/'))
+    if (imageItems.length > 0) {
+      e.preventDefault()
+      imageItems.forEach((item) => {
+        const file = item.getAsFile()
+        if (file) setAttachedFiles((prev) => [...prev, file])
+      })
+    }
+  }
+
+  const handleDrop = React.useCallback(async (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const droppedFiles = Array.from(e.dataTransfer.files || [])
+    const mergedFiles: File[] = [...droppedFiles]
+
+    const maybeAddFile = (file: File | null | undefined) => {
+      if (!file) return
+      if (!mergedFiles.some((existing) => existing.name === file.name && existing.size === file.size && existing.type === file.type)) {
+        mergedFiles.push(file)
+      }
+    }
+
+    for (const item of Array.from(e.dataTransfer.items || [])) {
+      if (item.kind === 'file') {
+        maybeAddFile(item.getAsFile())
+      } else if (item.kind === 'string') {
+        // support drag images from browser tabs
+        if (item.type === 'text/uri-list' || item.type === 'text/plain') {
+          const url = await new Promise<string>((resolve) => item.getAsString(resolve))
+          if (url && /\.(jpe?g|png|gif|webp|bmp)$/i.test(url)) {
+            try {
+              const response = await fetch(url)
+              if (response.ok) {
+                const blob = await response.blob()
+                const fileName = url.split('/').pop()?.split('?')[0] || 'image'
+                const generatedFile = new File([blob], fileName, { type: blob.type || 'image/png' })
+                maybeAddFile(generatedFile)
+              }
+            } catch (err) {
+              console.debug('Failed to fetch dropped URL as image', err)
+            }
+          }
+        }
+      }
+    }
+
+    if (mergedFiles.length) setAttachedFiles((prev) => [...prev, ...mergedFiles])
+  }, [])
+
+  const handleInputChange = React.useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value
     setMessageInput(value)
+
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current)
+    if (onTyping) {
+      onTyping(true)
+      typingTimeoutRef.current = setTimeout(() => { onTyping(false) }, 1500)
+    }
 
     const atIndex = value.lastIndexOf('@')
     if (atIndex !== -1 && (atIndex === 0 || value[atIndex - 1] === ' ')) {
@@ -253,7 +383,7 @@ export function ChatArea({
       setMentionQuery('')
       setMentionStart(-1)
     }
-  }
+  }, [onTyping])
 
   const handleStickerSelect = (url: string, pack?: StickerPack) => {
     const name = pack ? `sticker::${btoa(unescape(encodeURIComponent(JSON.stringify({ id: pack.id, name: pack.name, stickers: pack.stickers }))))}` : 'sticker'
@@ -272,13 +402,43 @@ export function ChatArea({
 
   const contextId = isDM && channel ? (channel.id === 'dm' ? '' : channel.id) : channel?.id || ''
 
-  const handlePinMessage = async (messageId: string) => {
-    if (contextId) { await db.pinMessage(contextId, messageId, currentUser.id); setPinnedRefresh((p) => p + 1) }
-  }
+  const mentionCandidates = React.useMemo(() => {
+    if (!showMentionDropdown || !mentionQuery.trim()) return []
+    const lower = mentionQuery.toLowerCase()
+    const users = members
+      .map((m) => ({ type: 'member' as const, member: m, display: `${m.displayName || m.username}` }))
+      .filter((entry) => entry.display.toLowerCase().includes(lower) || entry.member.username.toLowerCase().includes(lower))
+    const specials = [
+      { type: 'special' as const, key: '@everyone', label: '@everyone' },
+      { type: 'special' as const, key: '@here', label: '@here' },
+    ].filter((s) => s.label.toLowerCase().includes(lower))
+    return [...specials, ...users].slice(0, 12)
+  }, [members, mentionQuery, showMentionDropdown])
 
-  const handleUnpinMessage = async (messageId: string) => {
+  const handlePinMessage = React.useCallback(async (messageId: string) => {
+    if (contextId) { await db.pinMessage(contextId, messageId, currentUser.id); setPinnedRefresh((p) => p + 1) }
+  }, [contextId, currentUser.id])
+
+  const handleUnpinMessage = React.useCallback(async (messageId: string) => {
     if (contextId) { await db.unpinMessage(contextId, messageId); setPinnedRefresh((p) => p + 1) }
-  }
+  }, [contextId])
+
+  const messageListItems = React.useMemo(() => {
+    if (messages.length === 0) return null
+    return messages.map((message) => (
+      <div key={message.id} ref={(el) => { messageRefs.current[message.id] = el }}>
+        <MessageBubble
+          message={message} isOwnMessage={message.author.id === currentUser.id}
+          onAuthorClick={onMemberClick} onEdit={onEditMessage} onDelete={onDeleteMessage}
+          serverId={serverId} contextId={channel?.id || ''} onPin={handlePinMessage} onUnpin={handleUnpinMessage}
+          isPinned={pinnedMessageIds.has(message.id)}
+          canPin={canPin} currentUserId={currentUser.id} currentUser={currentUser}
+          onReply={handleReplyMessage}
+          onJumpToMessage={scrollToMessage}
+        />
+      </div>
+    ))
+  }, [messages, currentUser.id, onMemberClick, onEditMessage, onDeleteMessage, serverId, channel?.id, handlePinMessage, handleUnpinMessage, pinnedMessageIds, canPin, currentUser, handleReplyMessage, scrollToMessage])
 
   if (!channel) {
     return <div className="flex-1 flex items-center justify-center bg-[#1e1e2e]"><WumpusEmptyState type="no-channel" /></div>
@@ -288,7 +448,17 @@ export function ChatArea({
   const statusLabels: Record<string, string> = { online: t('chat.online'), idle: t('chat.idle'), dnd: t('chat.dnd'), offline: t('chat.offline') }
 
   return (
-    <div className="flex-1 flex flex-col bg-[#1e1e2e] min-h-0 overflow-hidden">
+    <div
+      className={`flex-1 flex flex-col bg-[#1e1e2e] min-h-0 overflow-hidden ${isDragging ? 'ring-2 ring-[#89b4fa] ring-offset-2 ring-offset-[#1e1e2e]' : ''}`}
+      onDragEnter={(e) => { e.preventDefault(); setIsDragging(true) }}
+      onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; setIsDragging(true) }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+          setIsDragging(false)
+        }
+      }}
+      onDrop={async (e) => { setIsDragging(false); await handleDrop(e) }}
+    >
       <div className="h-12 px-4 flex items-center justify-between border-b border-[#11111b] shadow-sm">
         <div className="flex items-center gap-2 min-w-0">
           {onOpenMobileMenu && (
@@ -355,7 +525,7 @@ export function ChatArea({
         </div>
       </div>
 
-      <div ref={messagesContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-4 py-4 space-y-4 relative min-h-0" style={{ fontSize: 'var(--chat-font-size, 16px)' }}>
+      <div ref={messagesContainerRef} onScroll={handleScroll} onDragOver={(e) => e.preventDefault()} onDrop={handleDrop} className="flex-1 overflow-y-auto px-4 py-4 space-y-4 relative min-h-0" style={{ fontSize: 'var(--chat-font-size, 16px)' }}>
         {showScrollTop && (
           <button onClick={scrollToTop} className="sticky top-2 float-right mr-0 z-20 w-8 h-8 rounded-full bg-[#313244] hover:bg-[#45475a] border border-[#45475a] text-[#bac2de] hover:text-[#cdd6f4] flex items-center justify-center shadow-lg transition-colors" title="Scroll to top">
             <ChevronUpIcon className="w-4 h-4" />
@@ -371,18 +541,14 @@ export function ChatArea({
             <p className="text-[#a6adc8]">{isDM ? `${t('chat.sayHello')}${channel.name}!` : `${t('chat.startOfChannel')}${channel.name}${t('chat.channel')}`}</p>
           </div>
         ) : (
-          messages.map((message) => (
-            <MessageBubble
-              key={message.id} message={message} isOwnMessage={message.author.id === currentUser.id}
-              onAuthorClick={onMemberClick} onEdit={onEditMessage} onDelete={onDeleteMessage}
-              serverId={serverId} onPin={handlePinMessage} onUnpin={handleUnpinMessage}
-              isPinned={pinnedMessageIds.has(message.id)}
-              canPin={canPin} currentUserId={currentUser.id}
-            />
-          ))
+          messageListItems
         )}
         <div ref={messagesEndRef} />
       </div>
+
+      {typingUsernames.length > 0 && (
+        <div className="px-4 py-2 text-xs text-[#a6e3a1]">{typingUsernames.join(', ')} {typingUsernames.length === 1 ? 'is' : 'are'} typing...</div>
+      )}
 
       {unreadCount > 0 && (
         <button onClick={scrollToBottom} className="absolute bottom-[140px] right-6 z-30 flex items-center gap-1.5 bg-[#cba6f7] hover:bg-[#b4befe] text-white text-xs font-semibold px-3 py-1.5 rounded-full shadow-lg shadow-[#cba6f7]/30 transition-colors">
@@ -407,22 +573,43 @@ export function ChatArea({
       )}
 
       <div className="px-4 pb-6 relative">
+        {replyToMessage && (
+          <div className="flex items-center justify-between bg-[#1f1b2e] border border-[#2c2640] text-sm text-[#cdd6f4] px-3 py-2 rounded mb-2">
+            <div className="truncate"><span className="font-semibold text-[#cba6f7]">Replying to {replyToMessage.author.displayName || replyToMessage.author.username}:</span> {replyToMessage.content.slice(0, 90)}</div>
+            <button onClick={() => setReplyToMessage(null)} className="text-[#f38ba8] hover:text-[#ffffff] font-bold">✕</button>
+          </div>
+        )}
         {showEmojiPicker && <div className="absolute bottom-full right-4 mb-2 z-50"><EmojiPicker onEmojiSelect={handleEmojiSelect} onClose={() => setShowEmojiPicker(false)} currentUserId={currentUser.id} onSendPack={handleSendEmojiPack} /></div>}
         {showGifStickerPicker && <div className="absolute bottom-full right-4 mb-2 z-50"><GifStickerPicker currentUserId={currentUser.id} onSelectGif={handleGifSelect} onSelectSticker={handleStickerSelect} onSendPack={handleSendPack} onClose={() => setShowGifStickerPicker(false)} /></div>}
         {showMentionDropdown && (
           <div className="absolute bottom-full left-4 mb-2 z-50 bg-[#181825] border border-[#11111b] rounded-lg shadow-lg max-h-48 overflow-y-auto w-64">
-            {members.filter(m => m.username.toLowerCase().includes(mentionQuery.toLowerCase()) || m.displayName?.toLowerCase().includes(mentionQuery.toLowerCase())).slice(0, 10).map(member => (
-              <button key={member.id} onClick={() => {
-                const before = messageInput.slice(0, mentionStart)
-                const after = messageInput.slice(mentionStart + mentionQuery.length + 1)
-                setMessageInput(`${before}@${member.username}${after}`)
-                setShowMentionDropdown(false)
-                textInputRef.current?.focus()
-              }} className="w-full px-3 py-2 text-left hover:bg-[#292b3d] flex items-center gap-2">
-                <UserAvatar user={member} size="sm" />
-                <span className="text-[#cdd6f4] text-sm">{member.displayName || member.username}</span>
-              </button>
-            ))}
+            {mentionCandidates.map((item) => {
+              if (item.type === 'special') {
+                return (
+                  <button key={item.key} onClick={() => {
+                    const before = messageInput.slice(0, mentionStart)
+                    const after = messageInput.slice(mentionStart + mentionQuery.length + 1)
+                    setMessageInput(`${before}${item.label} ${after}`)
+                    setShowMentionDropdown(false)
+                    textInputRef.current?.focus()
+                  }} className="w-full px-3 py-2 text-left hover:bg-[#292b3d] flex items-center gap-2">
+                    <span className="text-[#89b4fa] text-sm font-semibold">{item.label}</span>
+                  </button>
+                )
+              }
+              return (
+                <button key={item.member.id} onClick={() => {
+                  const before = messageInput.slice(0, mentionStart)
+                  const after = messageInput.slice(mentionStart + mentionQuery.length + 1)
+                  setMessageInput(`${before}@${item.member.username} ${after}`)
+                  setShowMentionDropdown(false)
+                  textInputRef.current?.focus()
+                }} className="w-full px-3 py-2 text-left hover:bg-[#292b3d] flex items-center gap-2">
+                  <UserAvatar user={item.member} size="sm" />
+                  <span className="text-[#cdd6f4] text-sm">{item.member.displayName || item.member.username}</span>
+                </button>
+              )
+            })}
           </div>
         )}
 
@@ -444,17 +631,18 @@ export function ChatArea({
                 <button onClick={stopRecording} className="bg-red-500 hover:bg-red-600 text-white rounded-full p-2 transition-colors" title="Stop and Send"><SquareIcon className="w-4 h-4" /></button>
               </div>
             ) : (
-              <div className="flex items-center gap-2 px-4">
-                <button onClick={() => fileInputRef.current?.click()} className="text-[#bac2de] hover:text-[#cdd6f4] transition-colors p-2" title={t('chat.attachFiles')}><PaperclipIcon className="w-5 h-5" /></button>
+              <div className="flex items-center gap-2 px-4 leading-none py-1">
+                <button onClick={() => fileInputRef.current?.click()} className="text-[#bac2de] hover:text-[#cdd6f4] transition-colors p-2 flex items-center justify-center" title={t('chat.attachFiles')}><PaperclipIcon className="w-5 h-5" /></button>
                 <input ref={fileInputRef} type="file" multiple onChange={handleFileSelect} className="hidden" />
-                <input ref={textInputRef} type="text" value={messageInput} onChange={handleInputChange} onKeyPress={handleKeyPress}
+                <textarea ref={textInputRef} value={messageInput} onChange={handleInputChange} onKeyDown={handleKeyPress} onPaste={handlePaste}
                   placeholder={`${t('chat.messagePlaceholder')} ${isDM ? '@' + channel.name : '#' + channel.name}`}
-                  className="flex-1 bg-transparent text-[#cdd6f4] placeholder-[#6c7086] py-3 focus:outline-none" />
-                <div className="flex items-center gap-1">
-                  <button onClick={() => { setShowGifStickerPicker(!showGifStickerPicker); setShowEmojiPicker(false) }} className={`transition-colors p-2 ${showGifStickerPicker ? 'text-[#cba6f7]' : 'text-[#bac2de] hover:text-[#cdd6f4]'}`} title="GIF & Stickers"><StickerIcon className="w-5 h-5" /></button>
-                  <button onClick={() => { setShowEmojiPicker(!showEmojiPicker); setShowGifStickerPicker(false) }} className={`transition-colors p-2 ${showEmojiPicker ? 'text-[#cba6f7]' : 'text-[#bac2de] hover:text-[#cdd6f4]'}`} title={t('chat.emoji')}><SmileIcon className="w-5 h-5" /></button>
-                  <button onClick={startRecording} className="text-[#bac2de] hover:text-[#cdd6f4] transition-colors p-2" title={t('chat.recordVoice')}><MicIcon className="w-5 h-5" /></button>
-                  {(messageInput.trim() || attachedFiles.length > 0) && <button onClick={handleSend} className="text-[#cba6f7] hover:text-[#b4befe] transition-colors p-2"><SendIcon className="w-5 h-5" /></button>}
+                  rows={1}
+                  className="flex-1 bg-transparent text-[#cdd6f4] placeholder-[#6c7086] py-2 resize-none focus:outline-none min-h-[56px] max-h-[220px] overflow-y-auto leading-relaxed" />
+                <div className="flex items-center gap-2">
+                  <button onClick={() => { setShowGifStickerPicker(!showGifStickerPicker); setShowEmojiPicker(false) }} className={`transition-colors p-2 flex items-center justify-center ${showGifStickerPicker ? 'text-[#cba6f7]' : 'text-[#bac2de] hover:text-[#cdd6f4]'}`} title="GIF & Stickers"><StickerIcon className="w-5 h-5" /></button>
+                  <button onClick={() => { setShowEmojiPicker(!showEmojiPicker); setShowGifStickerPicker(false) }} className={`transition-colors p-2 flex items-center justify-center ${showEmojiPicker ? 'text-[#cba6f7]' : 'text-[#bac2de] hover:text-[#cdd6f4]'}`} title={t('chat.emoji')}><SmileIcon className="w-5 h-5" /></button>
+                  <button onClick={startRecording} className="text-[#bac2de] hover:text-[#cdd6f4] transition-colors p-2 flex items-center justify-center" title={t('chat.recordVoice')}><MicIcon className="w-5 h-5" /></button>
+                  {(messageInput.trim() || attachedFiles.length > 0) && <button onClick={handleSend} className="text-[#cba6f7] hover:text-[#b4befe] transition-colors p-2 flex items-center justify-center"><SendIcon className="w-5 h-5" /></button>}
                 </div>
               </div>
             )}

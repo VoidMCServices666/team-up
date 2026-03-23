@@ -128,6 +128,7 @@ interface ChannelSidebarProps {
   isScreenSharing?: boolean;
   isCameraOn?: boolean;
   callStartTime?: number | null;
+  showVoicePanel?: boolean;
   onUpdateChannelLimit?: (channelId: string, limit: number | undefined) => void;
   onBack?: () => void;
 }
@@ -140,7 +141,7 @@ export function ChannelSidebar({
   onMemberClick, onStatusChange, onCustomStatusChange, selectedVoiceChannelId,
   onSelectVoiceChannel, onDeleteServer, voiceStates, onToggleScreenShare,
   onToggleCamera, isScreenSharing, isCameraOn, callStartTime,
-  onUpdateChannelLimit, onBack,
+  showVoicePanel, onUpdateChannelLimit, onBack,
 }: ChannelSidebarProps) {
   const { t } = useI18n();
   const [isMenuOpen, setIsMenuOpen] = useState(false);
@@ -314,7 +315,7 @@ export function ChannelSidebar({
       </div>
 
       {/* Voice Panel */}
-      {connectedVoice && (
+      {connectedVoice && !showVoicePanel && connectedVoice.serverId !== 'dm' && (
         <VoicePanel
           channelName={connectedVoice.channelName} 
           serverName={connectedVoice.serverName}

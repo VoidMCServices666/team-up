@@ -480,7 +480,7 @@ export function DMSidebar({
         </div>
       )}
 
-      {connectedVoice && (
+      {connectedVoice && connectedVoice.serverId === 'dm' && (
         <VoicePanel channelName={connectedVoice.channelName} serverName={connectedVoice.serverName}
           onDisconnect={onDisconnect} isMuted={isMuted} isDeafened={isDeafened}
           onToggleMute={onToggleMute} onToggleDeafen={onToggleDeafen}

@@ -15,6 +15,7 @@ interface VoicePanelProps {
   isScreenSharing?: boolean
   isCameraOn?: boolean
   joinedAt?: number
+  callElapsed?: number
   connectedUserCount?: number
   userLimit?: number
 }
@@ -24,18 +25,20 @@ export function VoicePanel({
   isMuted, isDeafened, onToggleMute, onToggleDeafen,
   onToggleScreenShare, onToggleCamera,
   isScreenSharing = false, isCameraOn = false,
-  joinedAt, connectedUserCount = 0, userLimit,
+  joinedAt, callElapsed, connectedUserCount = 0, userLimit,
 }: VoicePanelProps) {
   const { t } = useI18n()
   const [elapsed, setElapsed] = useState(0)
 
   useEffect(() => {
-    if (!joinedAt) return
+    if (callElapsed !== undefined || !joinedAt) return
     const tick = () => setElapsed(Math.floor((Date.now() - joinedAt) / 1000))
     tick()
     const interval = setInterval(tick, 1000)
     return () => clearInterval(interval)
-  }, [joinedAt])
+  }, [joinedAt, callElapsed])
+
+  const displayElapsed = callElapsed !== undefined ? callElapsed : elapsed
 
   const formatElapsed = (s: number) => {
     const h = Math.floor(s / 3600)
@@ -72,10 +75,10 @@ export function VoicePanel({
 
         {/* Timer + user count */}
         <div className="flex items-center justify-between">
-          {joinedAt ? (
+          {(joinedAt || callElapsed !== undefined) ? (
             <div className="flex items-center gap-1 text-[10px] text-white/30 font-mono tabular-nums">
               <Clock size={9} className="text-[#a6e3a1]" />
-              {formatElapsed(elapsed)}
+              {formatElapsed(displayElapsed)}
             </div>
           ) : <div />}
           <div className="flex items-center gap-1 text-[10px] text-white/25">

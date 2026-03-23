@@ -7,6 +7,7 @@ import { ChatArea } from './components/ChatArea'
 import { MemberList } from './components/MemberList'
 import { LoginScreen } from './components/LoginScreen'
 import { UserProfilePopup } from './components/UserProfilePopup'
+import { DMProfilePanel } from './components/DMProfilePanel'
 import { SettingsModal } from './components/SettingsModal'
 import { CreateServerModal } from './components/CreateServerModal'
 import { CreateChannelModal } from './components/CreateChannelModal'
@@ -14,6 +15,7 @@ import { CreateCategoryModal } from './components/CreateCategoryModal'
 import { ServerSettingsModal } from './components/ServerSettingsModal'
 import { ServerProfileEditor } from './components/ServerProfileEditor'
 import { VoiceChannelPanel } from './components/VoiceChannelPanel'
+import { VoicePanel } from './components/VoicePanel'
 import { CreateGroupDMModal } from './components/CreateGroupDMModal'
 import { UserAvatar } from './components/UserAvatar'
 import { InvitePage } from './components/InvitePage'
@@ -193,16 +195,65 @@ export function App() {
   const [localCameraStream, setLocalCameraStream] = useState<MediaStream | null>(null)
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null)
   const [remoteStreams, setRemoteStreams] = useState<RemoteStream[]>([])
+  const [callElapsed, setCallElapsed] = useState(0)
   const [mutedUserIds, setMutedUserIds] = useState<Set<string>>(new Set())
+  const [typingUsers, setTypingUsers] = useState<Record<string, boolean>>({})
   const [showCreateGroupDM, setShowCreateGroupDM] = useState(false)
   const [presenceMap, setPresenceMap] = useState<Record<string, string>>({})
   const [presenceLoaded, setPresenceLoaded] = useState(false)
+  const [isPresenceSet, setIsPresenceSet] = useState(false)
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({})
   const [rolesMap, setRolesMap] = useState<Record<string, Role[]>>({})
   const [dmVoiceStates, setDmVoiceStates] = useState<Record<string, 'calling' | 'in_call'>>({})
   const [incomingCall, setIncomingCall] = useState<{ callerId: string; channelId: string; callerUser?: Member } | null>(null)
 
   const currentMember: Member | null = currentUser ? storedUserToMember(currentUser) : null
+  const selectedDMUser = selectedDMUserId ? servers.flatMap(s => s.members).find((m) => m.id === selectedDMUserId) || dmUsersCache[selectedDMUserId] : undefined
+
+  const currentChatContextId = useMemo(() => {
+    if (!currentUser) return ''
+    if (view === 'server' && selectedChannelId) return selectedChannelId
+    if (view === 'home' && selectedGroupDMId) return db.getGroupDMChannelId(selectedGroupDMId)
+    if (view === 'home' && selectedDMUserId) return db.getDMChannelId(currentUser.id, selectedDMUserId)
+    return ''
+  }, [view, selectedChannelId, selectedGroupDMId, selectedDMUserId, currentUser?.id])
+
+  const setTypingStatus = React.useCallback(async (isTyping: boolean) => {
+    if (!currentUser || !currentChatContextId) return
+    try {
+      const typingRef = ref(rtdb, `typing/${currentChatContextId}/${currentUser.id}`)
+      if (isTyping) {
+        await set(typingRef, { typing: true, updatedAt: Date.now() })
+      } else {
+        const { remove } = await import('firebase/database')
+        await remove(typingRef)
+      }
+    } catch (err) {
+      console.error('[Typing] failed setting typing status', err)
+    }
+  }, [currentUser, currentChatContextId])
+
+  useEffect(() => {
+    if (!currentChatContextId) {
+      setTypingUsers({})
+      return
+    }
+    const typingChannelRef = ref(rtdb, `typing/${currentChatContextId}`)
+    const unsub = onValue(typingChannelRef, (snapshot) => {
+      const data = snapshot.val() || {}
+      const filtered: Record<string, boolean> = {}
+      Object.entries(data).forEach(([uid, value]: [string, any]) => {
+        if (uid === currentUser?.id) return
+        if (value?.typing) filtered[uid] = true
+      })
+      setTypingUsers(filtered)
+    })
+    return () => {
+      unsub()
+      setTypingUsers({})
+    }
+  }, [currentChatContextId, currentUser?.id])
+
   const presenceIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const lastManualStatusRef = useRef<'online' | 'idle' | 'dnd' | 'offline'>('online')
 
@@ -321,7 +372,8 @@ export function App() {
         await db.saveUser({ ...updatedUser, lastManualStatus: status } as any)
         setCurrentUser(updatedUser)
       }
-      syncChannel.postMessage({ type: 'users_updated' })
+      setIsPresenceSet(true)
+      syncChannel.postMessage({ type: 'users_updated' } )
     }
 
     // ✅ لما الـ connection تنقطع → امسح الـ voice state تلقائياً
@@ -450,13 +502,20 @@ export function App() {
   // ✅ لو presenceMap بيقول إننا offline بعد ما اتحمل → leave call
   useEffect(() => {
     if (!connectedVoice || !currentUser) return
-    if (!presenceLoaded) return // ✅ استنى لحد ما presenceMap يتحمل أول
+    if (!presenceLoaded || !isPresenceSet) return // ✅ استنى لحد ما presenceMap و own presence يتحدثوا
+
     const myStatus = presenceMap[currentUser.id]
-    if (myStatus === 'offline') {
-      console.log('[Presence] Self went offline, leaving call automatically')
-      handleLeaveVoice()
+    if (myStatus !== 'offline') return
+
+    // تجنّب قفل الوقت في الانتقال الأولي (race condition) لو local status لسه مزبوط
+    if (currentUser.status && currentUser.status !== 'offline') {
+      console.log('[Presence] Self presence offline race condition, keeping current call until stable')
+      return
     }
-  }, [presenceMap, connectedVoice?.channelId, presenceLoaded])
+
+    console.log('[Presence] Self went offline, leaving call automatically')
+    handleLeaveVoice()
+  }, [presenceMap, connectedVoice?.channelId, presenceLoaded, isPresenceSet, currentUser?.status])
 
   // ── Server bar position sync ──────────────────────────────────────────────
   useEffect(() => {
@@ -471,6 +530,36 @@ export function App() {
   }, [])
 
   const channelCallStartTime = connectedVoice ? db.getChannelCallStartTime(connectedVoice.channelId) : null
+
+  useEffect(() => {
+    if (!connectedVoice || !channelCallStartTime) {
+      setCallElapsed(0)
+      return
+    }
+
+    const resolveStartTime = (value: any): number => {
+      if (!value) return NaN
+      if (value instanceof Date) return value.getTime()
+      if (typeof value === 'number') return value
+      const parsed = Date.parse(value)
+      return Number.isNaN(parsed) ? NaN : parsed
+    }
+
+    const startTime = resolveStartTime(channelCallStartTime)
+    if (Number.isNaN(startTime)) {
+      setCallElapsed(0)
+      return
+    }
+
+    const updateElapsed = () => {
+      const now = Date.now()
+      setCallElapsed(Math.max(0, Math.floor((now - startTime) / 1000)))
+    }
+
+    updateElapsed()
+    const interval = setInterval(updateElapsed, 1000)
+    return () => clearInterval(interval)
+  }, [connectedVoice?.channelId, channelCallStartTime])
 
   // ── Load servers ──────────────────────────────────────────────────────────
   const refreshData = async () => {
@@ -820,7 +909,7 @@ export function App() {
     await refreshData()
   }
 
-  const handleSendMessage = async (content: string, attachments?: { name: string; size: number; url: string; type: string }[], voiceMessage?: { url: string; duration: number }) => {
+  const handleSendMessage = React.useCallback(async (content: string, attachments?: { name: string; size: number; url: string; type: string }[], voiceMessage?: { url: string; duration: number }, replyTo?: { messageId: string; content: string; authorName: string; authorAvatar?: string }) => {
     if (!currentUser || !currentMember) return
     let contextId = ''
     if (view === 'server' && selectedChannelId) contextId = selectedChannelId
@@ -850,10 +939,10 @@ export function App() {
       return att
     })) : undefined
 
-    const newMessage: Message = { id: crypto.randomUUID(), content, author: currentMember, timestamp: new Date(), attachments: safeAttachments, voiceMessage }
+    const newMessage: Message = { id: crypto.randomUUID(), content, author: currentMember, timestamp: new Date(), attachments: safeAttachments, voiceMessage, replyTo }
     setMessages((prev) => ({ ...prev, [contextId]: [...(prev[contextId] || []), newMessage] }))
     await db.saveMessage(contextId, newMessage)
-  }
+  }, [currentUser, currentMember, view, selectedChannelId, selectedGroupDMId, selectedDMUserId])
 
   // ✅ Group DM specific send - بيعرف الـ contextId من البراميتر مش من الـ state
   const handleSendGroupMessage = async (contextId: string, msgContent: string, attachments?: any[], voiceMessage?: any) => {
@@ -878,7 +967,7 @@ export function App() {
     await db.saveMessage(contextId, newMessage)
   }
 
-  const handleEditMessage = async (messageId: string, newContent: string) => {
+  const handleEditMessage = React.useCallback(async (messageId: string, newContent: string) => {
     if (!currentUser) return
     let contextId = ''
     if (view === 'server' && selectedChannelId) contextId = selectedChannelId
@@ -887,9 +976,9 @@ export function App() {
     else return
     await db.updateMessage(contextId, messageId, newContent)
     setMessages((prev) => ({ ...prev, [contextId]: prev[contextId]?.map((m) => m.id === messageId ? { ...m, content: newContent } : m) || [] }))
-  }
+  }, [currentUser, view, selectedChannelId, selectedGroupDMId, dmSelection])
 
-  const handleDeleteMessage = async (messageId: string) => {
+  const handleDeleteMessage = React.useCallback(async (messageId: string) => {
     if (!currentUser) return
     let contextId = ''
     if (view === 'server' && selectedChannelId) contextId = selectedChannelId
@@ -898,7 +987,7 @@ export function App() {
     else return
     await db.deleteMessage(contextId, messageId)
     setMessages((prev) => ({ ...prev, [contextId]: prev[contextId]?.filter((m) => m.id !== messageId) || [] }))
-  }
+  }, [currentUser, view, selectedChannelId, selectedGroupDMId, selectedDMUserId])
 
   const handleCreateChannel = async (name: string, type: 'text' | 'voice', userLimit?: number) => {
     if (!selectedServerId) return
@@ -1014,15 +1103,18 @@ export function App() {
   const handleToggleMute = async () => {
     const newMuted = !isMuted
     setIsMuted(newMuted); livekitVoiceManager.setMuted(newMuted)
+    setVoiceStates((prev) => prev.map((vs) => vs.userId === currentUser?.id ? { ...vs, isMuted: newMuted } : vs))
     if (connectedVoice && currentUser) await db.setVoiceState({ userId: currentUser.id, serverId: connectedVoice.serverId, channelId: connectedVoice.channelId, isMuted: newMuted, isDeafened, joinedAt: Date.now() })
   }
 
   const handleToggleDeafen = async () => {
     const newDeafened = !isDeafened
+    const newMuted = newDeafened ? true : false
     setIsDeafened(newDeafened); livekitVoiceManager.setDeafened(newDeafened)
-    if (newDeafened && !isMuted) { setIsMuted(true); livekitVoiceManager.setMuted(true) }
-    else if (!newDeafened) { setIsMuted(false); livekitVoiceManager.setMuted(false) }
-    if (connectedVoice && currentUser) await db.setVoiceState({ userId: currentUser.id, serverId: connectedVoice.serverId, channelId: connectedVoice.channelId, isMuted: isMuted || newDeafened, isDeafened: newDeafened, joinedAt: Date.now() })
+    if (newDeafened) { setIsMuted(true); livekitVoiceManager.setMuted(true) }
+    else { setIsMuted(false); livekitVoiceManager.setMuted(false) }
+    setVoiceStates((prev) => prev.map((vs) => vs.userId === currentUser?.id ? { ...vs, isMuted: newMuted, isDeafened: newDeafened } : vs))
+    if (connectedVoice && currentUser) await db.setVoiceState({ userId: currentUser.id, serverId: connectedVoice.serverId, channelId: connectedVoice.channelId, isMuted: newMuted, isDeafened: newDeafened, joinedAt: Date.now() })
   }
 
   const handleToggleScreenShare = async () => {
@@ -1113,10 +1205,10 @@ export function App() {
     } catch (err) { console.error('Failed DM call:', err) }
   }
 
-  const handleProfileClick = (member: Member, e: React.MouseEvent) => {
+  const handleProfileClick = React.useCallback((member: Member, e: React.MouseEvent) => {
     // ✅ استخدم mouse position مباشرة عشان يطلع جنب الماوس
     setActiveProfile({ member, position: { x: e.clientX, y: e.clientY } })
-  }
+  }, [])
 
   const handleSelectVoiceChannel = (channel: Channel) => {
     setSelectedVoiceChannelId(channel.id)
@@ -1181,7 +1273,7 @@ export function App() {
                   }}
                   onStatusChange={handleStatusChange} onCustomStatusChange={handleCustomStatusChange}
                   onToggleScreenShare={handleToggleScreenShare} onToggleCamera={handleToggleCamera}
-                  isScreenSharing={isScreenSharing} isCameraOn={isCameraOn} callStartTime={channelCallStartTime}
+                  isScreenSharing={isScreenSharing} isCameraOn={isCameraOn} callStartTime={channelCallStartTime} callElapsed={callElapsed}
                   onCreateGroupDM={() => setShowCreateGroupDM(true)} selectedGroupDMId={selectedGroupDMId}
                   onSelectGroupDM={(id) => { setDmSelection(id ? { type: 'group', id } : null); if (id) setMobilePanel('chat') }}
                   onBack={() => setMobilePanel('servers')}
@@ -1222,13 +1314,25 @@ export function App() {
                           onOpenMobileMenu={() => setMobilePanel('channels')} />
                       </div>
                     )}
-                    <ChatArea channel={{ id: db.getDMChannelId(currentUser.id, selectedDMUserId), name: 'DM', type: 'text' }}
-                      messages={currentMessages} onSendMessage={handleSendMessage} onEditMessage={handleEditMessage} onDeleteMessage={handleDeleteMessage}
-                      currentUser={currentMember} onMemberClick={handleProfileClick} showMemberList={false} onToggleMemberList={() => {}} isDM={true}
-                      onStartCall={(withVideo) => handleStartDMCall(selectedDMUserId!, withVideo)} dmUserId={selectedDMUserId}
-                      dmUser={servers.flatMap(s => s.members).find(m => m.id === selectedDMUserId) || dmUsersCache[selectedDMUserId] || undefined}
-                      presenceMap={presenceMap}
-                      onOpenMobileMenu={() => setMobilePanel('channels')} />
+                    <div className="flex-1 flex">
+                      <ChatArea channel={{ id: db.getDMChannelId(currentUser.id, selectedDMUserId), name: 'DM', type: 'text' }}
+                        messages={currentMessages} onSendMessage={handleSendMessage} onEditMessage={handleEditMessage} onDeleteMessage={handleDeleteMessage}
+                        currentUser={currentMember} onMemberClick={handleProfileClick} showMemberList={false} onToggleMemberList={() => {}} isDM={true}
+                        onStartCall={(withVideo) => handleStartDMCall(selectedDMUserId!, withVideo)} dmUserId={selectedDMUserId}
+                        dmUser={selectedDMUser}
+                        members={servers.flatMap(s => s.members)}
+                        presenceMap={presenceMap}
+                        contextId={currentChatContextId}
+                        typingUsers={Object.keys(typingUsers)}
+                        onTyping={(isTyping) => setTypingStatus(isTyping)}
+                        onOpenMobileMenu={() => setMobilePanel('channels')} />
+                      {selectedDMUser && currentMember && (
+                        <DMProfilePanel dmUser={selectedDMUser} currentUserId={currentMember.id}
+                          onStartCall={(withVideo) => handleStartDMCall(selectedDMUserId!, withVideo)}
+                          onClose={() => {}}
+                          presenceMap={presenceMap} />
+                      )}
+                    </div>
                   </div>
                 </div>
               ) : selectedGroupDMId ? (
@@ -1286,7 +1390,8 @@ export function App() {
                     selectedVoiceChannelId={selectedVoiceChannelId} onSelectVoiceChannel={handleSelectVoiceChannel}
                     onDeleteServer={() => handleDeleteServer(selectedServer.id)} voiceStates={voiceStates}
                     onToggleScreenShare={handleToggleScreenShare} onToggleCamera={handleToggleCamera}
-                    isScreenSharing={isScreenSharing} isCameraOn={isCameraOn} callStartTime={channelCallStartTime}
+                    isScreenSharing={isScreenSharing} isCameraOn={isCameraOn} callStartTime={channelCallStartTime} callElapsed={callElapsed}
+                    showVoicePanel={showVoicePanel}
                     onUpdateChannelLimit={async (channelId, limit) => {
                       const srv = servers.find((s) => s.id === selectedServerId)
                       if (!srv || !currentUser) return
@@ -1312,7 +1417,10 @@ export function App() {
                     onSendMessage={handleSendMessage} onEditMessage={handleEditMessage} onDeleteMessage={handleDeleteMessage}
                     currentUser={currentMember} onMemberClick={handleProfileClick}
                     showMemberList={showMemberList} onToggleMemberList={() => setShowMemberList(!showMemberList)}
-                    serverId={selectedServerId || undefined} serverMembers={selectedServer?.members}
+                    serverId={selectedServerId || undefined} serverMembers={selectedServer?.members} members={selectedServer?.members || []}
+                    contextId={currentChatContextId}
+                    typingUsers={Object.keys(typingUsers)}
+                    onTyping={(isTyping) => setTypingStatus(isTyping)}
                     onOpenMobileMenu={() => setMobilePanel('channels')} />
                 )}
                 {showMemberList && selectedServer && !showVoicePanel && (
